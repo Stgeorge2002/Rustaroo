@@ -56,6 +56,40 @@ cargo test --lib --test test_network --test test_cleaning_reference
 
 ## Usage
 
+### Container package
+
+The publishing workflow builds a Linux x86-64 container containing Rustaroo,
+CD-HIT and MAFFT. After the package has been published, run it with Docker:
+
+```bash
+docker run --rm ghcr.io/stgeorge2002/rustaroo:1.0.0 --version
+docker run --rm -v "$PWD:/data" ghcr.io/stgeorge2002/rustaroo:1.0.0 \
+  -i /data/genome1.gff /data/genome2.gff \
+  -o /data/results --clean-mode strict --threads 20 --skip-core-aln
+```
+
+For an HPC using Apptainer:
+
+```bash
+apptainer pull rustaroo-1.0.0.sif docker://ghcr.io/stgeorge2002/rustaroo:1.0.0
+apptainer exec --cleanenv --bind "$PWD:/data" rustaroo-1.0.0.sif \
+  rustaroo -i /data/genome1.gff /data/genome2.gff \
+  -o /data/results --clean-mode strict --threads 20 --skip-core-aln
+```
+
+Run analyses inside a scheduler allocation. The image does not include optional
+annotation tools such as Prokka or Prodigal.
+
+Maintainers can publish an existing release using **Actions > Publish container >
+Run workflow**, selecting the default branch and entering its tag (for example
+`v1.0.0`). The workflow uses packaging files from the selected workflow revision
+and pipeline source from that release tag, verifies the version, and smoke-tests
+the image before publishing. Future stable `vX.Y.Z` tag pushes also trigger it.
+No personal access token is required: the workflow uses `GITHUB_TOKEN` with
+package-write permission. If the new GHCR package is private, change its package
+visibility to public to allow unauthenticated pulls. Record the published image
+digest when pinning a benchmark environment.
+
 ### Main Pipeline
 
 ```bash
