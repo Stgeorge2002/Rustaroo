@@ -1,6 +1,6 @@
 //! Rustaroo: a Rust pipeline for pangenome investigation.
 
-pub const VERSION: &str = "1.8.1";
+pub const VERSION: &str = "1.0.0";
 
 pub mod abundance_plots;
 pub mod alignment;
