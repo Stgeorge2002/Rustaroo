@@ -5,6 +5,7 @@ use crate::network::Graph;
 use crate::network::{GeneEdge, GeneNode};
 use anyhow::{Context, Result};
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 use std::collections::HashSet;
 
 /// Merge multiple nodes into a single new node
@@ -150,7 +151,25 @@ pub fn merge_node_cluster(
 
 /// Delete a node from the graph
 pub fn delete_node(graph: &mut Graph<GeneNode, GeneEdge>, node: NodeIndex) -> Result<()> {
-    if graph.node_weight(node).is_some() {
+    if let Some(data) = graph.node_weight(node) {
+        let members: Vec<_> = data.members.iter().copied().collect();
+        let mut neighbours_by_member = std::collections::BTreeMap::<usize, Vec<NodeIndex>>::new();
+        for edge in graph.edges(node) {
+            let neighbour = edge.target();
+            if neighbour != node {
+                for &member in &edge.weight().members {
+                    neighbours_by_member
+                        .entry(member)
+                        .or_default()
+                        .push(neighbour);
+                }
+            }
+        }
+        for member in members {
+            if let Some(neighbours) = neighbours_by_member.get_mut(&member) {
+                connect_neighbours(graph, member, neighbours);
+            }
+        }
         graph.remove_node(node);
     }
     Ok(())
@@ -166,10 +185,22 @@ pub fn remove_member_from_node(
         return Ok(());
     }
 
-    graph[node].members.remove(&member);
-    if graph[node].size > 0 {
-        graph[node].size -= 1;
+    if !graph[node].members.contains(&member) {
+        return Ok(());
     }
+    connect_member_neighbours(graph, node, member);
+    let edges: Vec<_> = graph.edges(node).map(|edge| edge.id()).collect();
+    for edge in edges {
+        let data = graph.edge_weight_mut(edge).context("Missing graph edge")?;
+        data.members.remove(&member);
+        data.size = data.members.len();
+        if data.members.is_empty() {
+            graph.remove_edge(edge);
+        }
+    }
+
+    graph[node].members.remove(&member);
+    graph[node].size = graph[node].members.len();
 
     // Remove sequences belonging to this member
     graph[node].seq_ids.retain(|seq_id| {
@@ -182,6 +213,47 @@ pub fn remove_member_from_node(
     });
 
     Ok(())
+}
+
+fn connect_member_neighbours(
+    graph: &mut Graph<GeneNode, GeneEdge>,
+    node: NodeIndex,
+    member: usize,
+) {
+    let mut neighbours: Vec<_> = graph
+        .edges(node)
+        .filter(|edge| edge.weight().members.contains(&member))
+        .map(|edge| edge.target())
+        .filter(|&neighbour| neighbour != node)
+        .collect();
+    connect_neighbours(graph, member, &mut neighbours);
+}
+
+fn connect_neighbours(
+    graph: &mut Graph<GeneNode, GeneEdge>,
+    member: usize,
+    neighbours: &mut Vec<NodeIndex>,
+) {
+    neighbours.sort_unstable();
+    neighbours.dedup();
+    for (index, &first) in neighbours.iter().enumerate() {
+        for &second in &neighbours[index + 1..] {
+            if let Some(edge) = graph.find_edge(first, second) {
+                let data = &mut graph[edge];
+                data.members.insert(member);
+                data.size = data.members.len();
+            } else {
+                graph.add_edge(
+                    first,
+                    second,
+                    GeneEdge {
+                        size: 1,
+                        members: std::collections::BTreeSet::from([member]),
+                    },
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -210,5 +282,164 @@ mod tests {
         remove_member_from_node(&mut graph, node, 1).unwrap();
         assert_eq!(graph[node].members.len(), 1);
         assert!(!graph[node].members.contains(&1));
+    }
+
+    #[test]
+    fn removing_member_reconnects_only_its_neighbours_and_preserves_existing_support() {
+        use std::collections::BTreeSet;
+        let mut graph = Graph::default();
+        let center = graph.add_node(GeneNode {
+            members: BTreeSet::from([0, 1]),
+            size: 2,
+            seq_ids: HashSet::from(["0_1".into(), "1_1".into()]),
+            ..Default::default()
+        });
+        let left = graph.add_node(GeneNode::default());
+        let right = graph.add_node(GeneNode::default());
+        let other = graph.add_node(GeneNode::default());
+        graph.add_edge(
+            left,
+            center,
+            GeneEdge {
+                size: 2,
+                members: BTreeSet::from([0, 1]),
+            },
+        );
+        graph.add_edge(
+            center,
+            right,
+            GeneEdge {
+                size: 1,
+                members: BTreeSet::from([0]),
+            },
+        );
+        graph.add_edge(
+            center,
+            other,
+            GeneEdge {
+                size: 1,
+                members: BTreeSet::from([1]),
+            },
+        );
+        graph.add_edge(
+            left,
+            right,
+            GeneEdge {
+                size: 1,
+                members: BTreeSet::from([2]),
+            },
+        );
+        remove_member_from_node(&mut graph, center, 0).unwrap();
+        let replacement = graph.find_edge(left, right).unwrap();
+        assert_eq!(graph[replacement].members, BTreeSet::from([0, 2]));
+        assert_eq!(graph[replacement].size, 2);
+        assert_eq!(
+            graph[graph.find_edge(left, center).unwrap()].members,
+            BTreeSet::from([1])
+        );
+        assert!(graph.find_edge(center, right).is_none());
+        assert!(graph.find_edge(right, other).is_none());
+        assert_eq!(graph[center].seq_ids, HashSet::from(["1_1".into()]));
+    }
+
+    #[test]
+    fn deleting_node_reconnects_each_genome_separately() {
+        use std::collections::BTreeSet;
+        let mut graph = Graph::default();
+        let center = graph.add_node(GeneNode {
+            members: BTreeSet::from([0, 1]),
+            size: 2,
+            ..Default::default()
+        });
+        let a = graph.add_node(GeneNode::default());
+        let b = graph.add_node(GeneNode::default());
+        let c = graph.add_node(GeneNode::default());
+        graph.add_edge(
+            center,
+            a,
+            GeneEdge {
+                size: 1,
+                members: BTreeSet::from([0]),
+            },
+        );
+        graph.add_edge(
+            b,
+            center,
+            GeneEdge {
+                size: 2,
+                members: BTreeSet::from([0, 1]),
+            },
+        );
+        graph.add_edge(
+            center,
+            c,
+            GeneEdge {
+                size: 1,
+                members: BTreeSet::from([1]),
+            },
+        );
+        delete_node(&mut graph, center).unwrap();
+        assert_eq!(
+            graph[graph.find_edge(a, b).unwrap()].members,
+            BTreeSet::from([0])
+        );
+        assert_eq!(
+            graph[graph.find_edge(b, c).unwrap()].members,
+            BTreeSet::from([1])
+        );
+        assert!(graph.find_edge(a, c).is_none());
+    }
+
+    #[test]
+    fn indexed_reconnection_matches_per_member_scans() {
+        use std::collections::BTreeSet;
+        let mut graph = Graph::default();
+        let center = graph.add_node(GeneNode {
+            members: BTreeSet::from([0, 1, 2]),
+            size: 3,
+            ..Default::default()
+        });
+        let nodes: Vec<_> = (0..4)
+            .map(|_| graph.add_node(GeneNode::default()))
+            .collect();
+        for (first, second, members) in [
+            (center, nodes[0], vec![0, 1]),
+            (nodes[1], center, vec![0, 2]),
+            (center, nodes[1], vec![1]),
+            (center, nodes[2], vec![1, 2]),
+            (nodes[3], center, vec![0, 2]),
+            (center, center, vec![0, 1]),
+            (nodes[1], nodes[0], vec![3]),
+            (nodes[0], nodes[1], vec![4]),
+        ] {
+            graph.add_edge(
+                first,
+                second,
+                GeneEdge {
+                    size: members.len(),
+                    members: members.into_iter().collect(),
+                },
+            );
+        }
+        let mut expected = graph.clone();
+        for member in [0, 1, 2] {
+            connect_member_neighbours(&mut expected, center, member);
+        }
+        expected.remove_node(center);
+        delete_node(&mut graph, center).unwrap();
+        let snapshot = |graph: &Graph<GeneNode, GeneEdge>| {
+            graph
+                .edge_indices()
+                .map(|edge| {
+                    (
+                        edge,
+                        graph.edge_endpoints(edge),
+                        graph[edge].size,
+                        graph[edge].members.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(snapshot(&graph), snapshot(&expected));
     }
 }

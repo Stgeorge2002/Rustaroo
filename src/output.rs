@@ -7,7 +7,7 @@ use crate::network::{GeneEdge, GeneNode};
 use anyhow::{Context, Result};
 use petgraph::graph::NodeIndex;
 use petgraph::visit::{IntoEdgeReferences, IntoNodeIdentifiers};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -110,7 +110,7 @@ pub fn generate_roary_gene_presence_absence(
         family_names.insert(node_idx, gene_name.clone());
 
         // Build presence/absence vector
-        let mut pres_abs = vec!["".to_string(); isolates.len()];
+        let mut pres_abs = BTreeMap::<usize, String>::new();
         let mut seq_ids: Vec<_> = node.seq_ids.iter().collect();
         seq_ids.sort();
         for seq_id in seq_ids {
@@ -127,16 +127,17 @@ pub fn generate_roary_gene_presence_absence(
                 .get(&member)
                 .with_context(|| format!("Missing isolate name for genome {}", member))?;
             let id = orig_ids.get(seq_id).unwrap_or(seq_id);
-            if pres_abs[idx].is_empty() {
-                pres_abs[idx] = id.clone();
+            let value = pres_abs.entry(idx).or_default();
+            if value.is_empty() {
+                *value = id.clone();
             } else {
-                pres_abs[idx].push_str(&format!(";{}", id));
+                value.push_str(&format!(";{}", id));
             }
         }
 
-        let entry_size = pres_abs.iter().filter(|s| !s.is_empty()).count();
+        let entry_size = pres_abs.values().filter(|s| !s.is_empty()).count();
 
-        let mut entry = vec![
+        let entry = vec![
             gene_name.clone(),
             node.annotation.clone(),
             node.description.clone(),
@@ -159,15 +160,18 @@ pub fn generate_roary_gene_presence_absence(
                 }
             ),
         ];
-        entry.extend(pres_abs.clone());
-
         entries.push((entry_size, gene_name, entry, pres_abs));
     }
 
     // Sort by entry size (most common first)
     entries.sort_by(|a, b| b.0.cmp(&a.0));
 
-    for (_size, gene_name, entry, pres_abs) in entries {
+    for (_size, gene_name, mut entry, sparse) in entries {
+        let mut pres_abs = vec!["".to_string(); isolates.len()];
+        for (index, value) in sparse {
+            pres_abs[index] = value;
+        }
+        entry.extend(pres_abs.iter().cloned());
         writeln!(roary_file, "{}", entry.join(","))?;
 
         let mut simple_entry = entry[0..3].to_vec();
@@ -397,6 +401,47 @@ mod tests {
             "Gene,Non-unique Gene name,Annotation,first,middle,last"
         );
         assert_eq!(lines[1], "gene,gene,,original_a;original_b,,original_c");
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_rows_preserve_all_output_bytes_and_stable_ties() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let mut graph = Graph::default();
+        graph.add_node(GeneNode {
+            annotation: "gene".into(),
+            description: "first".into(),
+            size: 1,
+            seq_ids: HashSet::from(["0_0_1".into()]),
+            lengths: vec![3],
+            ..Default::default()
+        });
+        graph.add_node(GeneNode {
+            annotation: "gene".into(),
+            description: "second".into(),
+            size: 1,
+            seq_ids: HashSet::from(["1_0_1".into(), "1_0_2".into()]),
+            lengths: vec![3, 6],
+            ..Default::default()
+        });
+        graph.add_node(GeneNode {
+            annotation: "other".into(),
+            size: 2,
+            seq_ids: HashSet::from(["0_0_2".into(), "1_0_3".into()]),
+            lengths: vec![6],
+            ..Default::default()
+        });
+        let names = HashMap::from([(0, "A".into()), (1, "B".into())]);
+        let ids = HashMap::from([("1_0_1".into(), "".into()), ("1_0_2".into(), "real".into())]);
+        generate_roary_gene_presence_absence(&graph, &names, &ids, dir.path().to_str().unwrap())?;
+        assert_eq!(std::fs::read_to_string(dir.path().join("gene_presence_absence.csv"))?,
+            "Gene,Non-unique Gene name,Annotation,A,B\nother,other,,0_0_2,1_0_3\ngene,gene,first,0_0_1,\ngroup_0,gene,second,,real\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("gene_presence_absence.Rtab"))?,
+            "Gene\tA\tB\nother\t1\t1\ngene\t1\t0\ngroup_0\t0\t1\n"
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("gene_presence_absence_roary.csv"))?,
+            "Gene,Non-unique Gene name,Annotation,No. isolates,No. sequences,Avg sequences per isolate,Genome Fragment,Order within Fragment,Accessory Fragment,Accessory Order with Fragment,QC,Min group size nuc,Max group size nuc,Avg group size nuc,A,B\nother,other,,2,2,1.00,3,1,,,,6,6,6.0,0_0_2,1_0_3\ngene,gene,first,1,1,1.00,1,1,,,,3,3,3.0,0_0_1,\ngroup_0,gene,second,1,2,2.00,2,1,,,,3,6,4.5,,real\n");
         Ok(())
     }
 }

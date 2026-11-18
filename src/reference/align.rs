@@ -651,7 +651,13 @@ fn fit_with_keyed(
             return None;
         }
         let votes = &mut scratch.ranked;
-        votes.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let rank = |a: &(isize, u32), b: &(isize, u32)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
+        if votes.len() > 8 {
+            votes.select_nth_unstable_by(8, rank);
+            votes[..8].sort_unstable_by(rank);
+        } else {
+            votes.sort_unstable_by(rank);
+        }
         let best_votes = votes[0].1;
         let mut chosen: Option<(isize, Fit)> = None;
         // Same contender selection as the reference: filter then take(8).
@@ -679,11 +685,15 @@ fn fit_with_keyed(
         }
         let (best_diag, mut fit) = chosen?;
         if fit.identity < 0.95 || fit.coverage < 0.90 {
-            if let Some((second, _)) = votes.iter().find(|(diagonal, v)| {
-                *diagonal != best_diag
-                    && (*diagonal - best_diag).unsigned_abs() > 5
-                    && v.saturating_mul(5) >= best_votes
-            }) {
+            if let Some((second, _)) = votes
+                .iter()
+                .filter(|(diagonal, v)| {
+                    *diagonal != best_diag
+                        && (*diagonal - best_diag).unsigned_abs() > 5
+                        && v.saturating_mul(5) >= best_votes
+                })
+                .min_by(|a, b| rank(a, b))
+            {
                 fit.internal_gap = (*second - best_diag).unsigned_abs();
             }
         }

@@ -29,5 +29,5 @@ fn test_reverse_complement() {
 
 #[test]
 fn test_reverse_complement_mixed_case() {
-    assert_eq!(reverse_complement("AtCg"), "CgAt");
+    assert_eq!(reverse_complement("AtCg"), "cGaT");
 }

@@ -2,6 +2,54 @@
 
 Rustaroo is a Rust pipeline for pangenome investigation. The core pipeline is runnable, but this is still a work in progress: exact behavioral parity with the baseline implementation, all original utilities, and full-pipeline performance equivalence have not been established. It incorporates reference-selection code from the earlier [rustaroo-alpha](https://github.com/Stgeorge2002/rustaroo-alpha) project.
 
+## Experimental refinding development
+
+This working copy identifies itself as `1.1.0-dev`; it is not the `v1.0.0` release.
+Its experimental refinding applies to all families and adds Panaroo-inspired
+overlap and consensus filtering, six-frame translation, graph reconnection,
+and post-refinding family collapse. Results can therefore differ for named
+families as well as `group_` families.
+
+The Rust nucleotide alignment is not proven equivalent to Panaroo's Edlib
+alignment. Comparisons of 1,500 synthetic search cases found no differences,
+but these cases are not a biological validation and do not establish parity
+for all alignments. Strict refind mode
+validates the best hit rather than reproducing Panaroo's last-anchor validation
+quirk. Handling of ambiguity codes other than `N` is not guaranteed to match
+Biopython. Overall output agreement and performance have not been established, and
+this development copy should not be treated as a validated replacement.
+
+Refinding shares immutable query matchers across genomes and reuses alignment
+and padding buffers within parallel workers. Endpoint searches widen an exact
+edit-distance bound until a match exists, without changing acceptance thresholds.
+Start recovery and traceback use 64-bit global-alignment blocks for wider edit
+bands, retaining scalar banded recovery for very narrow bands. First/last optimal
+endpoints and the existing traceback tie priorities are preserved by design and
+checked against the scalar implementation on synthetic inputs. Conflict-location
+searches also run in parallel, with results replayed in their original order.
+The progress bar counts both conflict locations and missing-family searches.
+Reference selection reports a final count of excluded short refound candidates;
+per-candidate details are shown only with `--verbose` (debug logging).
+
+Successful CLI runs print a final wall-time breakdown, including separate DNA
+and protein similarity-index construction, family collapse, refinding,
+post-refinding cleaning, and output stages. Refinding also reports preparation,
+parallel searches, conflict/consensus filtering, and translation/graph/output
+times. Parallel worker times are not summed; percentages use the pipeline wall
+time before process teardown. Use `/usr/bin/time` for whole-command elapsed time.
+Timing reports are suppressed by `--quiet` and do not change analysis outputs.
+
+An optional synthetic alignment microbenchmark compares the new kernel against
+unbounded endpoint search with scalar banded recovery, using precompiled queries
+on both sides:
+
+```bash
+cargo test --release --lib refind_kernel_timing -- --ignored --nocapture --test-threads=1
+```
+
+These timings exclude parsing, query compilation, filtering and output, and do
+not establish whole-stage speedup or a fivefold performance guarantee.
+
 ## Overview
 
 The implementation uses Rust for annotation processing and graph operations and invokes external tools such as CD-HIT and MAFFT. The project builds the `rustaroo` executable and exposes a `rustaroo` Rust library.

@@ -54,6 +54,7 @@ struct SampleLocations {
 
 struct Selected {
     choice: Choice,
+    excluded_refound_short: usize,
     distinct: usize,
     intact: usize,
     exact_samples: usize,
@@ -108,6 +109,7 @@ pub fn generate_pan_genome_reference(
     let mut pools = Pools::default();
     let mut dna_ids = HashMap::new();
     let mut protein_ids = HashMap::new();
+    let mut dna_proteins = Vec::new();
     let mut calls = Vec::with_capacity(members.len());
     // Rustaroo's physical-locus tests require genomic order, not HashSet order.
     members.sort_by(|a, b| a.id.cmp(&b.id));
@@ -137,12 +139,18 @@ pub fn generate_pan_genome_reference(
             pools.dna.push(member.dna.clone());
             id
         });
-        let protein = translate(&member.dna);
-        let protein = *protein_ids.entry(protein.clone()).or_insert_with(|| {
-            let id = pools.protein.len();
-            pools.protein.push(protein);
-            id
-        });
+        let protein = if dna < dna_proteins.len() {
+            dna_proteins[dna]
+        } else {
+            let protein = translate(&member.dna);
+            let protein = *protein_ids.entry(protein.clone()).or_insert_with(|| {
+                let id = pools.protein.len();
+                pools.protein.push(protein);
+                id
+            });
+            dna_proteins.push(protein);
+            protein
+        };
         calls.push((
             member.id.clone(),
             Call {
@@ -186,6 +194,10 @@ pub fn generate_pan_genome_reference(
             )
         })
         .collect::<Result<_>>()?;
+    let excluded_refound_short: usize = selected
+        .iter()
+        .map(|selected| selected.excluded_refound_short)
+        .sum();
 
     let mut fasta = BufWriter::new(File::create(
         Path::new(output_dir).join("pan_genome_reference.fa"),
@@ -221,6 +233,10 @@ pub fn generate_pan_genome_reference(
     }
     fasta.flush()?;
     report.flush()?;
+    log::info!(
+        "Reference selection: excluded {} distinct short refound candidates",
+        excluded_refound_short
+    );
     Ok(())
 }
 
@@ -248,6 +264,7 @@ fn select(
         .map(String::len)
         .max()
         .unwrap_or(0);
+    let mut excluded_refound_short = 0;
     if longest_annotated > 0 {
         let annotated_sequences: FxSet<_> = annotated
             .iter()
@@ -257,7 +274,8 @@ fn select(
             let keep = annotated_sequences.contains(allele.dna.as_str())
                 || allele.dna.len() * 100 >= longest_annotated * 95;
             if !keep {
-                log::info!(
+                excluded_refound_short += 1;
+                log::debug!(
                     "reference_candidate\texcluded_refound_short\tcluster\t{cluster}\tbp\t{}",
                     allele.dna.len()
                 );
@@ -299,6 +317,7 @@ fn select(
     }
     sources.sort();
     Ok(Selected {
+        excluded_refound_short,
         distinct: alleles.len(),
         intact: alleles
             .iter()

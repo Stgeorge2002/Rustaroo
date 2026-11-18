@@ -11,34 +11,52 @@ use petgraph::visit::{EdgeRef, NodeIndexable};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
+pub fn clean_misassembly_edges(graph: &mut Graph<GeneNode, GeneEdge>, threshold: usize) {
+    let bad: Vec<_> = graph
+        .edge_indices()
+        .filter(|&edge| {
+            let (first, second) = graph
+                .edge_endpoints(edge)
+                .expect("Existing edge has endpoints");
+            let support = graph[edge].size;
+            support < threshold
+                && (graph[first].has_end
+                    || graph[second].has_end
+                    || (support as f64) < 0.05 * graph[first].size.min(graph[second].size) as f64)
+        })
+        .collect();
+    for edge in bad {
+        graph.remove_edge(edge);
+    }
+}
+
 /// Trim low support trailing ends (genes at contig ends with low support)
 pub fn trim_low_support_trailing_ends(
     graph: &mut Graph<GeneNode, GeneEdge>,
     min_support: usize,
     max_recursive: usize,
 ) -> Result<()> {
+    let mut candidates: Vec<_> = graph.node_indices().collect();
     for _iteration in 0..max_recursive {
-        let mut bad_nodes = Vec::new();
-        let mut removed = false;
-
-        for node_idx in graph.node_indices() {
-            let degree = graph.edges(node_idx).count();
-            if degree <= 1 {
-                // Trailing node
-                if graph[node_idx].size < min_support {
-                    bad_nodes.push(node_idx);
-                }
-            }
-        }
-
-        for node in bad_nodes {
-            graph.remove_node(node);
-            removed = true;
-        }
-
-        if !removed {
+        let bad_nodes: Vec<_> = candidates
+            .into_iter()
+            .filter(|&node| {
+                graph.node_weight(node).is_some()
+                    && graph[node].size < min_support
+                    && graph.edges(node).count() <= 1
+            })
+            .collect();
+        if bad_nodes.is_empty() {
             break;
         }
+        let mut affected = Vec::new();
+        for node in bad_nodes {
+            affected.extend(graph.neighbors(node));
+            graph.remove_node(node);
+        }
+        affected.sort_unstable();
+        affected.dedup();
+        candidates = affected;
     }
 
     Ok(())
@@ -106,6 +124,53 @@ fn mod_bfs_edges_with_scratch(
 #[cfg(test)]
 mod bfs_tests {
     use super::*;
+
+    #[test]
+    fn misassembly_cleaning_respects_support_and_fraction_boundaries() {
+        let mut graph = Graph::<GeneNode, GeneEdge>::default();
+        let large = graph.add_node(GeneNode {
+            size: 100,
+            ..Default::default()
+        });
+        let end = graph.add_node(GeneNode {
+            size: 100,
+            has_end: true,
+            ..Default::default()
+        });
+        let equal_fraction = graph.add_node(GeneNode {
+            size: 100,
+            ..Default::default()
+        });
+        let low_fraction = graph.add_node(GeneNode {
+            size: 100,
+            ..Default::default()
+        });
+        let at_threshold = graph.add_node(GeneNode {
+            size: 100,
+            has_end: true,
+            ..Default::default()
+        });
+        for (node, size) in [
+            (end, 5),
+            (equal_fraction, 5),
+            (low_fraction, 4),
+            (at_threshold, 6),
+        ] {
+            graph.add_edge(
+                large,
+                node,
+                GeneEdge {
+                    size,
+                    members: BTreeSet::new(),
+                },
+            );
+        }
+        clean_misassembly_edges(&mut graph, 6);
+        assert!(graph.find_edge(large, end).is_none());
+        assert!(graph.find_edge(large, equal_fraction).is_some());
+        assert!(graph.find_edge(large, low_fraction).is_none());
+        assert!(graph.find_edge(large, at_threshold).is_some());
+    }
 
     #[test]
     fn reusable_bfs_preserves_depth_limited_reachability() {
@@ -523,9 +588,13 @@ pub fn collapse_paralogs(
             .iter()
             .map(|_| BTreeSet::from([reference_member]))
             .collect();
+        let targets: BTreeSet<_> = contexts
+            .iter()
+            .filter_map(|&(node, member)| (member != reference_member).then_some(node))
+            .collect();
         let distances: Vec<_> = references
             .iter()
-            .map(|&reference| graph_distances(graph, reference))
+            .map(|&reference| graph_distances(graph, reference, &targets))
             .collect();
         let reference_contexts: Vec<_> = references
             .iter()
@@ -586,15 +655,23 @@ pub fn collapse_paralogs(
 fn graph_distances(
     graph: &Graph<GeneNode, GeneEdge>,
     source: NodeIndex,
+    targets: &BTreeSet<NodeIndex>,
 ) -> HashMap<NodeIndex, usize> {
     let mut distances = HashMap::from([(source, 0usize)]);
     let mut queue = VecDeque::from([source]);
+    let mut remaining = targets.len() - usize::from(targets.contains(&source));
     while let Some(node) = queue.pop_front() {
+        if remaining == 0 {
+            break;
+        }
         let distance = distances[&node] + 1;
         for neighbor in graph.neighbors(node) {
             if let std::collections::hash_map::Entry::Vacant(entry) = distances.entry(neighbor) {
                 entry.insert(distance);
                 queue.push_back(neighbor);
+                if targets.contains(&neighbor) {
+                    remaining -= 1;
+                }
             }
         }
     }
@@ -612,6 +689,102 @@ fn weighted_context(graph: &Graph<GeneNode, GeneEdge>, node: NodeIndex) -> HashM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontier_trim_matches_full_scans_for_rounds_and_parallel_edges() {
+        let mut state = 17u64;
+        for _ in 0..200 {
+            let mut graph = Graph::default();
+            let nodes: Vec<_> = (0..8)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    graph.add_node(GeneNode {
+                        size: (state >> 32) as usize % 5,
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            for _ in 0..20 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let a = nodes[(state >> 32) as usize % nodes.len()];
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let b = nodes[(state >> 32) as usize % nodes.len()];
+                graph.add_edge(
+                    a,
+                    b,
+                    GeneEdge {
+                        size: 1,
+                        members: BTreeSet::new(),
+                    },
+                );
+            }
+            for rounds in 0..=4 {
+                let mut expected = graph.clone();
+                for _ in 0..rounds {
+                    let bad: Vec<_> = expected
+                        .node_indices()
+                        .filter(|&node| {
+                            expected[node].size < 3 && expected.edges(node).count() <= 1
+                        })
+                        .collect();
+                    if bad.is_empty() {
+                        break;
+                    }
+                    for node in bad {
+                        expected.remove_node(node);
+                    }
+                }
+                let mut actual = graph.clone();
+                trim_low_support_trailing_ends(&mut actual, 3, rounds).unwrap();
+                assert_eq!(
+                    actual.node_indices().collect::<Vec<_>>(),
+                    expected.node_indices().collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    actual
+                        .edge_indices()
+                        .map(|edge| (edge, actual.edge_endpoints(edge)))
+                        .collect::<Vec<_>>(),
+                    expected
+                        .edge_indices()
+                        .map(|edge| (edge, expected.edge_endpoints(edge)))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn limited_distances_match_full_bfs_for_reachable_and_unreachable_targets() {
+        let mut graph = Graph::default();
+        let nodes: Vec<_> = (0..8)
+            .map(|_| graph.add_node(GeneNode::default()))
+            .collect();
+        for (a, b) in [(0, 1), (1, 2), (2, 3), (2, 4), (4, 5), (6, 7)] {
+            graph.add_edge(
+                nodes[a],
+                nodes[b],
+                GeneEdge {
+                    size: 1,
+                    members: BTreeSet::new(),
+                },
+            );
+        }
+        let all: BTreeSet<_> = nodes.iter().copied().collect();
+        for source in &nodes {
+            let full = graph_distances(&graph, *source, &all);
+            for targets in [
+                BTreeSet::new(),
+                BTreeSet::from([nodes[2], nodes[3]]),
+                BTreeSet::from([nodes[0], nodes[7]]),
+            ] {
+                let limited = graph_distances(&graph, *source, &targets);
+                for target in targets {
+                    assert_eq!(limited.get(&target), full.get(&target));
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_trim_trailing_ends() {

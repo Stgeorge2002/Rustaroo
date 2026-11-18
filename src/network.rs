@@ -2,7 +2,7 @@
 //!
 
 use anyhow::{Context, Result};
-use petgraph::graph::NodeIndex;
+use petgraph::graph::{EdgeIndex, NodeIndex};
 use petgraph::stable_graph::StableGraph;
 use petgraph::Undirected;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -253,6 +253,7 @@ fn build_graph(
     let mut centroid_context: HashMap<String, Vec<(NodeIndex, usize)>> = HashMap::new();
     let mut seqid_to_centroid = HashMap::new();
     let mut node_map: HashMap<usize, NodeIndex> = HashMap::new();
+    let mut edge_index = HashMap::new();
     let mut prev: Option<NodeIndex> = None;
     let mut previous_location: Option<(usize, usize)> = None;
 
@@ -353,7 +354,7 @@ fn build_graph(
                             s
                         },
                     };
-                    graph.add_edge(p, node_idx, edge);
+                    add_indexed_edge(&mut graph, &mut edge_index, p, node_idx, edge);
                 }
                 prev = Some(node_idx);
             } else {
@@ -380,7 +381,7 @@ fn build_graph(
                                 s
                             },
                         };
-                        graph.add_edge(p, node_idx, edge);
+                        add_indexed_edge(&mut graph, &mut edge_index, p, node_idx, edge);
                     }
                     prev = Some(node_idx);
                 } else {
@@ -397,7 +398,7 @@ fn build_graph(
                     }
 
                     if let Some(p) = prev {
-                        if let Some(edge_idx) = graph.find_edge(p, node_idx) {
+                        if let Some(edge_idx) = indexed_edge(&edge_index, p, node_idx) {
                             graph[edge_idx].size += 1;
                             graph[edge_idx].members.insert(genome_id);
                         } else {
@@ -409,7 +410,7 @@ fn build_graph(
                                     s
                                 },
                             };
-                            graph.add_edge(p, node_idx, edge);
+                            add_indexed_edge(&mut graph, &mut edge_index, p, node_idx, edge);
                         }
                     }
                     prev = Some(node_idx);
@@ -423,6 +424,28 @@ fn build_graph(
     }
 
     Ok((graph, centroid_context, seqid_to_centroid))
+}
+
+fn indexed_edge(
+    index: &HashMap<(NodeIndex, NodeIndex), EdgeIndex>,
+    first: NodeIndex,
+    second: NodeIndex,
+) -> Option<EdgeIndex> {
+    index
+        .get(&(first, second))
+        .or_else(|| index.get(&(second, first)))
+        .copied()
+}
+
+fn add_indexed_edge(
+    graph: &mut Graph<GeneNode, GeneEdge>,
+    index: &mut HashMap<(NodeIndex, NodeIndex), EdgeIndex>,
+    first: NodeIndex,
+    second: NodeIndex,
+    edge: GeneEdge,
+) {
+    let edge = graph.add_edge(first, second, edge);
+    index.insert((first, second), edge);
 }
 
 fn add_node(
@@ -495,6 +518,32 @@ fn add_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_edges_match_graph_lookup_with_parallel_edges_and_loops() {
+        let mut graph = Graph::default();
+        let a = graph.add_node(GeneNode::default());
+        let b = graph.add_node(GeneNode::default());
+        let c = graph.add_node(GeneNode::default());
+        let mut index = HashMap::new();
+        for (first, second) in [(a, b), (b, a), (a, a), (b, c), (a, b), (a, a), (b, a)] {
+            add_indexed_edge(
+                &mut graph,
+                &mut index,
+                first,
+                second,
+                GeneEdge {
+                    size: 1,
+                    members: BTreeSet::new(),
+                },
+            );
+            for x in [a, b, c] {
+                for y in [a, b, c] {
+                    assert_eq!(indexed_edge(&index, x, y), graph.find_edge(x, y));
+                }
+            }
+        }
+    }
     use std::io::Write;
     use tempfile::NamedTempFile;
 

@@ -138,8 +138,11 @@ impl FamilyIndex {
                                 return edges;
                             }
                             let query = PreparedQuery::new(&sequences[first], dna, &builder);
+                            let limit = query.threshold_distance(threshold);
                             for &second in &cluster[offset + 1..] {
-                                if query.identity(&sequences[second]) >= threshold {
+                                if threshold == 0.0
+                                    || query.matches_with_limit(&sequences[second], limit)
+                                {
                                     edges.push((first, second));
                                 }
                             }
@@ -189,9 +192,17 @@ impl FamilyIndex {
             for &position in &positions[1..] {
                 join(&mut parent, positions[0], position);
             }
-            for neighbor in &self.close[centroid] {
-                if let Some(other_positions) = centroid_nodes.get(neighbor) {
-                    join(&mut parent, positions[0], other_positions[0]);
+            if self.close[centroid].len() <= centroid_nodes.len() {
+                for neighbor in &self.close[centroid] {
+                    if let Some(other_positions) = centroid_nodes.get(neighbor) {
+                        join(&mut parent, positions[0], other_positions[0]);
+                    }
+                }
+            } else {
+                for (neighbor, other_positions) in &centroid_nodes {
+                    if self.close[centroid].contains(neighbor) {
+                        join(&mut parent, positions[0], other_positions[0]);
+                    }
                 }
             }
         }
@@ -273,6 +284,33 @@ impl PreparedQuery {
             .as_ref()
             .map_or(forward, |reverse| forward.max(score(reverse)))
     }
+
+    fn threshold_distance(&self, threshold: f64) -> usize {
+        let passes = |distance: usize| 1.0 - distance as f64 / self.length as f64 >= threshold;
+        let (mut low, mut high) = (0, self.length / 2 + 1);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if passes(mid) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low - 1
+    }
+
+    fn matches_with_limit(&self, target: &str, limit: usize) -> bool {
+        self.forward
+            .find_all_end(target.as_bytes(), limit)
+            .next()
+            .is_some()
+            || self.reverse.as_ref().is_some_and(|reverse| {
+                reverse
+                    .find_all_end(target.as_bytes(), limit)
+                    .next()
+                    .is_some()
+            })
+    }
 }
 
 fn equality_builder(dna: bool) -> MyersBuilder {
@@ -326,6 +364,72 @@ mod tests {
     }
 
     #[test]
+    fn bounded_threshold_matches_full_identity_at_boundaries() {
+        for dna in [false, true] {
+            let builder = equality_builder(dna);
+            for query in ["A", "ACGT", "DNEQ", "ACGTACGT", "NNNN"] {
+                let prepared = PreparedQuery::new(query, dna, &builder);
+                for target in ["A", "ACGT", "TTTT", "BBZZ", "ACGTACGA", "NNNN", "XXXX", ""] {
+                    let identity = prepared.identity(target);
+                    for threshold in [
+                        0.0,
+                        0.25,
+                        0.5,
+                        0.75,
+                        0.9,
+                        1.0,
+                        identity,
+                        (identity + f64::EPSILON).min(1.0),
+                    ] {
+                        assert_eq!(
+                            threshold == 0.0
+                                || prepared.matches_with_limit(
+                                    target,
+                                    prepared.threshold_distance(threshold)
+                                ),
+                            identity >= threshold,
+                            "dna={dna} query={query} target={target} threshold={threshold}"
+                        );
+                    }
+                    for dna in [false, true] {
+                        let builder = equality_builder(dna);
+                        for length in [63, 64, 65, 127, 128, 129] {
+                            let query: String = (0..length)
+                                .map(|i| "ACGT".as_bytes()[(i * 3 + i / 7) % 4] as char)
+                                .collect();
+                            let prepared = PreparedQuery::new(&query, dna, &builder);
+                            let mut target = query.clone().into_bytes();
+                            for position in (3..length).step_by(9) {
+                                target[position] = b'N';
+                            }
+                            let target = String::from_utf8(target).unwrap();
+                            let identity = prepared.identity(&target);
+                            for threshold in [
+                                0.0,
+                                0.5,
+                                0.9,
+                                1.0,
+                                identity,
+                                (identity + f64::EPSILON).min(1.0),
+                            ] {
+                                assert_eq!(
+                                    threshold == 0.0
+                                        || prepared.matches_with_limit(
+                                            &target,
+                                            prepared.threshold_distance(threshold)
+                                        ),
+                                    identity >= threshold,
+                                    "dna={dna} length={length} threshold={threshold}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sparse_clustering_connects_all_centroids_of_merged_nodes() {
         let mut graph = Graph::default();
         let first = graph.add_node(GeneNode {
@@ -356,6 +460,39 @@ mod tests {
         assert_eq!(
             index.clusters(&graph, &[first, second, third]).unwrap(),
             vec![vec![first, second], vec![third]]
+        );
+    }
+
+    #[test]
+    fn clustering_ignores_nonlocal_neighbours_and_keeps_node_order() {
+        let mut graph = Graph::default();
+        let a = graph.add_node(GeneNode {
+            centroid: vec!["a".into()],
+            ..Default::default()
+        });
+        let b = graph.add_node(GeneNode {
+            centroid: vec!["b".into()],
+            ..Default::default()
+        });
+        let c = graph.add_node(GeneNode {
+            centroid: vec!["c".into()],
+            ..Default::default()
+        });
+        let mut close = vec![HashSet::new(); 20];
+        close[0].extend(1..20);
+        close[1].insert(0);
+        let mut index = FamilyIndex {
+            centroid_to_index: HashMap::from([("a".into(), 0), ("b".into(), 1), ("c".into(), 2)]),
+            close,
+        };
+        assert_eq!(
+            index.clusters(&graph, &[c, a, b]).unwrap(),
+            vec![vec![c, a, b]]
+        );
+        index.close[0].remove(&2);
+        assert_eq!(
+            index.clusters(&graph, &[c, a, b]).unwrap(),
+            vec![vec![c], vec![a, b]]
         );
     }
 }

@@ -1,6 +1,400 @@
 //! Sequence alignment utilities using edlib-style algorithms
 
 use bio::pattern_matching::myers::long::Myers;
+use bio::pattern_matching::myers::MyersBuilder;
+use once_cell::sync::OnceCell;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RefindAlignment {
+    pub distance: usize,
+    pub start: usize,
+    pub end: usize,
+    pub terminal_insertions: usize,
+}
+
+fn refind_equal(a: u8, b: u8) -> bool {
+    a == b
+        || (b"ACGT".contains(&a) && b"NE".contains(&b))
+        || (b"NE".contains(&a) && b"ACGT".contains(&b))
+}
+
+pub(crate) struct RefindMatcher {
+    query: Vec<u8>,
+    length: usize,
+    matcher: Myers<u64>,
+    forward: OnceCell<GlobalPattern>,
+    reverse: OnceCell<GlobalPattern>,
+}
+
+#[derive(Clone, Copy)]
+struct GlobalState {
+    positive: u64,
+    negative: u64,
+    distance: usize,
+}
+
+struct GlobalBlock {
+    equal: [u64; 256],
+    length: usize,
+}
+
+struct GlobalPattern {
+    blocks: Vec<GlobalBlock>,
+}
+
+impl GlobalPattern {
+    fn new(query: impl Iterator<Item = u8>) -> Self {
+        let mut blocks = Vec::new();
+        for base in query {
+            if blocks
+                .last()
+                .map_or(true, |block: &GlobalBlock| block.length == 64)
+            {
+                blocks.push(GlobalBlock {
+                    equal: [0; 256],
+                    length: 0,
+                });
+            }
+            let block = blocks.last_mut().expect("query has a block");
+            let bit = 1u64 << block.length;
+            block.equal[base as usize] |= bit;
+            let equivalents: &[u8] = match base {
+                b'A' | b'C' | b'G' | b'T' => b"NE",
+                b'N' | b'E' => b"ACGT",
+                _ => b"",
+            };
+            for &symbol in equivalents {
+                block.equal[symbol as usize] |= bit;
+            }
+            block.length += 1;
+        }
+        Self { blocks }
+    }
+
+    fn reset(&self, states: &mut Vec<GlobalState>) {
+        states.clear();
+        let mut distance = 0;
+        for block in &self.blocks {
+            distance += block.length;
+            states.push(GlobalState {
+                positive: u64::MAX,
+                negative: 0,
+                distance,
+            });
+        }
+    }
+
+    fn advance(&self, states: &mut [GlobalState], base: u8) -> usize {
+        // A global alignment charges for every target prefix: the top row
+        // increases by one, unlike the free-prefix HW endpoint search.
+        let mut carry = 1i8;
+        for (block, state) in self.blocks.iter().zip(states.iter_mut()) {
+            let equal = block.equal[base as usize];
+            let vertical = equal | state.negative;
+            let equal = equal | u64::from(carry < 0);
+            let horizontal =
+                ((equal & state.positive).wrapping_add(state.positive) ^ state.positive) | equal;
+            let mut positive = state.negative | !(horizontal | state.positive);
+            let mut negative = state.positive & horizontal;
+            let boundary = 1u64 << (block.length - 1);
+            let next_carry =
+                i8::from(positive & boundary != 0) - i8::from(negative & boundary != 0);
+            state.distance = state.distance.wrapping_add_signed(next_carry as isize);
+            positive = (positive << 1) | u64::from(carry > 0);
+            negative = (negative << 1) | u64::from(carry < 0);
+            state.positive = negative | !(vertical | positive);
+            state.negative = positive & vertical;
+            carry = next_carry;
+        }
+        states.last().expect("nonempty query").distance
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RefindScratch {
+    states: Vec<GlobalState>,
+    columns: Vec<GlobalState>,
+    previous: Vec<usize>,
+    current: Vec<usize>,
+    paths: Vec<u8>,
+    row_offsets: Vec<usize>,
+    row_starts: Vec<usize>,
+}
+
+impl RefindScratch {
+    fn distance(&self, pattern: &GlobalPattern, row: usize, column: usize) -> usize {
+        if row == 0 {
+            return column;
+        }
+        if column == 0 {
+            return row;
+        }
+        let block = (row - 1) / 64;
+        let state = self.columns[(column - 1) * pattern.blocks.len() + block];
+        let local_row = (row - 1) % 64 + 1;
+        let above = if local_row == 64 {
+            0
+        } else {
+            u64::MAX << local_row
+        };
+        let used = u64::MAX >> (64 - pattern.blocks[block].length);
+        let mask = above & used;
+        state.distance + (state.negative & mask).count_ones() as usize
+            - (state.positive & mask).count_ones() as usize
+    }
+}
+
+impl RefindMatcher {
+    pub fn new(query: &[u8]) -> Option<Self> {
+        if query.is_empty() {
+            return None;
+        }
+        let mut builder = MyersBuilder::new();
+        for base in b"ACGT" {
+            builder.ambig(*base, b"NE");
+        }
+        builder.ambig(b'N', b"ACGT");
+        builder.ambig(b'E', b"ACGT");
+        Some(Self {
+            query: query.to_vec(),
+            length: query.len(),
+            matcher: builder.build_long_64(query),
+            forward: OnceCell::new(),
+            reverse: OnceCell::new(),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn align(&self, target: &[u8]) -> Option<RefindAlignment> {
+        self.align_with_scratch(target, &mut RefindScratch::default())
+    }
+
+    pub fn align_with_scratch(
+        &self,
+        target: &[u8],
+        scratch: &mut RefindScratch,
+    ) -> Option<RefindAlignment> {
+        if target.is_empty() {
+            return None;
+        }
+        let mut best = usize::MAX;
+        let mut first_end = 0;
+        let mut last_end = 0;
+        let mut limit = (self.length / 32).max(1).min(self.length);
+        loop {
+            for (end, distance) in self.matcher.find_all_end(target, limit) {
+                if distance < best {
+                    best = distance;
+                    first_end = end + 1;
+                    last_end = end + 1;
+                } else if distance == best {
+                    last_end = end + 1;
+                }
+            }
+            if best != usize::MAX {
+                break;
+            }
+            if limit == self.length {
+                return None;
+            }
+            limit = limit.saturating_mul(4).min(self.length);
+        }
+        if best == 0 {
+            return Some(RefindAlignment {
+                distance: 0,
+                start: last_end - self.length,
+                end: last_end,
+                terminal_insertions: 0,
+            });
+        }
+        // Very narrow scalar bands cost less than visiting every 64-bit block.
+        let blocks = (self.length - 1) / 64 + 1;
+        if best.saturating_mul(2).saturating_add(1) < blocks.saturating_mul(4) {
+            return Some(self.recover_banded(target, best, first_end, last_end, scratch));
+        }
+        let forward = self
+            .forward
+            .get_or_init(|| GlobalPattern::new(self.query.iter().copied()));
+        let reverse = self
+            .reverse
+            .get_or_init(|| GlobalPattern::new(self.query.iter().rev().copied()));
+        let find_start = |end: usize, scratch: &mut RefindScratch| {
+            reverse.reset(&mut scratch.states);
+            let mut start = None;
+            for j in 1..=end.min(self.length.saturating_add(best)) {
+                if reverse.advance(&mut scratch.states, target[end - j]) == best {
+                    start = Some(end - j);
+                }
+            }
+            start.expect("Optimal alignment has a start")
+        };
+        let start = find_start(last_end, scratch);
+        let first_start = if first_end == last_end {
+            start
+        } else {
+            find_start(first_end, scratch)
+        };
+        let first_target = &target[first_start..first_end];
+        let width = first_target.len();
+        forward.reset(&mut scratch.states);
+        scratch.columns.clear();
+        scratch.columns.reserve(width * forward.blocks.len());
+        for &base in first_target {
+            forward.advance(&mut scratch.states, base);
+            scratch.columns.extend_from_slice(&scratch.states);
+        }
+        let (mut i, mut j) = (self.length, width);
+        let mut trailing = 0;
+        let mut leading = 0;
+        let mut at_end = true;
+        while i > 0 || j > 0 {
+            let distance = scratch.distance(forward, i, j);
+            if i > 0 && (j == 0 || distance == scratch.distance(forward, i - 1, j) + 1) {
+                if at_end {
+                    trailing += 1;
+                }
+                leading += 1;
+                i -= 1;
+            } else {
+                at_end = false;
+                leading = 0;
+                if i == 0 || distance == scratch.distance(forward, i, j - 1) + 1 {
+                    j -= 1;
+                } else {
+                    i -= 1;
+                    j -= 1;
+                }
+            }
+        }
+        Some(RefindAlignment {
+            distance: best,
+            start,
+            end: last_end,
+            terminal_insertions: trailing + leading,
+        })
+    }
+
+    fn recover_banded(
+        &self,
+        target: &[u8],
+        best: usize,
+        first_end: usize,
+        last_end: usize,
+        scratch: &mut RefindScratch,
+    ) -> RefindAlignment {
+        let query = &self.query;
+        let cap = best + 1;
+        let find_start = |end: usize, scratch: &mut RefindScratch| {
+            scratch.previous.clear();
+            scratch
+                .previous
+                .extend((0..=self.length).map(|i| i.min(cap)));
+            scratch.current.resize(self.length + 1, cap);
+            scratch.current.fill(cap);
+            let mut start = None;
+            for j in 1..=end.min(self.length.saturating_add(best)) {
+                scratch.current[0] = j.min(cap);
+                let first = j.saturating_sub(best).max(1);
+                let last = j.saturating_add(best).min(self.length);
+                if first > 1 {
+                    scratch.current[first - 1] = cap;
+                }
+                if last < self.length {
+                    scratch.current[last + 1] = cap;
+                }
+                for i in first..=last {
+                    let diagonal = scratch.previous[i - 1]
+                        + usize::from(!refind_equal(query[self.length - i], target[end - j]));
+                    scratch.current[i] = diagonal
+                        .min(scratch.previous[i] + 1)
+                        .min(scratch.current[i - 1] + 1)
+                        .min(cap);
+                }
+                if scratch.current[self.length] == best {
+                    start = Some(end - j);
+                }
+                std::mem::swap(&mut scratch.previous, &mut scratch.current);
+            }
+            start.expect("Optimal alignment has a start")
+        };
+        let start = find_start(last_end, scratch);
+        let first_start = if first_end == last_end {
+            start
+        } else {
+            find_start(first_end, scratch)
+        };
+        let first_target = &target[first_start..first_end];
+        let width = first_target.len();
+        scratch.previous.clear();
+        scratch.previous.extend((0..=width).map(|j| j.min(cap)));
+        scratch.current.resize(width + 1, cap);
+        scratch.current.fill(cap);
+        scratch.paths.clear();
+        scratch.row_offsets.resize(self.length + 1, 0);
+        scratch.row_starts.resize(self.length + 1, 0);
+        for i in 1..=self.length {
+            scratch.current[0] = i.min(cap);
+            let first = i.saturating_sub(best).max(1);
+            let last = i.saturating_add(best).min(width);
+            if first > 1 && first - 1 <= width {
+                scratch.current[first - 1] = cap;
+            }
+            if last < width {
+                scratch.current[last + 1] = cap;
+            }
+            scratch.row_offsets[i] = scratch.paths.len();
+            scratch.row_starts[i] = first;
+            for j in first..=last {
+                let insertion = scratch.previous[j] + 1;
+                let deletion = scratch.current[j - 1] + 1;
+                let diagonal = scratch.previous[j - 1]
+                    + usize::from(!refind_equal(query[i - 1], first_target[j - 1]));
+                scratch.current[j] = insertion.min(deletion).min(diagonal).min(cap);
+                scratch.paths.push(if scratch.current[j] == insertion {
+                    1
+                } else if scratch.current[j] == deletion {
+                    2
+                } else {
+                    0
+                });
+            }
+            std::mem::swap(&mut scratch.previous, &mut scratch.current);
+        }
+        let (mut i, mut j) = (self.length, width);
+        let mut trailing = 0;
+        let mut leading = 0;
+        let mut at_end = true;
+        while i > 0 || j > 0 {
+            let op = if i == 0 {
+                2
+            } else if j == 0 {
+                1
+            } else {
+                scratch.paths[scratch.row_offsets[i] + j - scratch.row_starts[i]]
+            };
+            if op == 1 {
+                if at_end {
+                    trailing += 1;
+                }
+                leading += 1;
+                i -= 1;
+            } else {
+                at_end = false;
+                leading = 0;
+                if op == 0 {
+                    i -= 1;
+                }
+                j -= 1;
+            }
+        }
+        RefindAlignment {
+            distance: best,
+            start,
+            end: last_end,
+            terminal_insertions: trailing + leading,
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct HwEditScratch {
@@ -154,6 +548,344 @@ pub fn calculate_identity(edit_distance: usize, alignment_length: usize) -> f64 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn random_sequence(length: usize, alphabet: &[u8], state: &mut u64) -> Vec<u8> {
+        (0..length)
+            .map(|_| {
+                *state ^= *state << 13;
+                *state ^= *state >> 7;
+                *state ^= *state << 17;
+                alphabet[*state as usize % alphabet.len()]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn global_bit_columns_match_scalar_cells_across_block_boundaries() {
+        let mut seed = 0x73ac_49b1_02u64;
+        let mut scratch = RefindScratch::default();
+        for length in [1, 2, 63, 64, 65, 127, 128, 129, 257] {
+            let query = random_sequence(length, b"ACGTNEXac?", &mut seed);
+            let target = random_sequence(length + 17, b"ACGTNEXac?", &mut seed);
+            let pattern = GlobalPattern::new(query.iter().copied());
+            pattern.reset(&mut scratch.states);
+            scratch.columns.clear();
+            let mut previous: Vec<_> = (0..=length).collect();
+            let mut current = vec![0; length + 1];
+            for (column, &base) in target.iter().enumerate() {
+                pattern.advance(&mut scratch.states, base);
+                scratch.columns.extend_from_slice(&scratch.states);
+                current[0] = column + 1;
+                for row in 1..=length {
+                    current[row] = (previous[row] + 1)
+                        .min(current[row - 1] + 1)
+                        .min(previous[row - 1] + usize::from(!refind_equal(query[row - 1], base)));
+                }
+                for (row, &expected) in current.iter().enumerate() {
+                    assert_eq!(
+                        scratch.distance(&pattern, row, column + 1),
+                        expected,
+                        "length={length} row={row} column={column}"
+                    );
+                }
+                std::mem::swap(&mut previous, &mut current);
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_refind_preserves_ambiguous_indels_ties_and_reused_state() {
+        let mut seed = 0x8bc4_5921_dfe3u64;
+        let mut scratch = RefindScratch::default();
+        for case in 0..400 {
+            let length = 1 + case % 260;
+            let query = random_sequence(length, b"ACGTNEX", &mut seed);
+            let mut target = match case % 4 {
+                0 => random_sequence(length * 2 + 9, b"ACGTNEX", &mut seed),
+                1 => query.clone(),
+                2 => query[..length / 2 + 1].to_vec(),
+                _ => [query.as_slice(), b"TTGAC", query.as_slice()].concat(),
+            };
+            if case % 4 != 0 {
+                for index in (0..target.len()).step_by(7) {
+                    target[index] = b"ACGT"[index % 4];
+                }
+                target.insert(target.len() / 2, b'C');
+                target.remove(target.len() / 3);
+            }
+            let padding = length / 2;
+            let target = [vec![b'E'; padding], target, vec![b'E'; padding]].concat();
+            let matcher = RefindMatcher::new(&query).unwrap();
+            let expected = full_refind(&query, &target);
+            assert_eq!(
+                matcher.align_with_scratch(&target, &mut scratch),
+                expected,
+                "case={case} query={query:?} target={target:?}"
+            );
+            assert_eq!(matcher.align_with_scratch(b"", &mut scratch), None);
+        }
+        for length in [63, 64, 65, 127, 128, 129, 1024] {
+            let query = random_sequence(length, b"ACGT", &mut seed);
+            let mut target = random_sequence(length * 3, b"ACGT", &mut seed);
+            target.extend(&query);
+            target.extend(&query);
+            let matcher = RefindMatcher::new(&query).unwrap();
+            assert_eq!(
+                matcher.align_with_scratch(&target, &mut scratch),
+                full_refind(&query, &target)
+            );
+        }
+    }
+
+    fn scalar_recovery_comparator(matcher: &RefindMatcher, target: &[u8]) -> RefindAlignment {
+        let mut best = usize::MAX;
+        let mut first_end = 0;
+        let mut last_end = 0;
+        for (end, distance) in matcher.matcher.find_all_end(target, matcher.length) {
+            if distance < best {
+                best = distance;
+                first_end = end + 1;
+                last_end = end + 1;
+            } else if distance == best {
+                last_end = end + 1;
+            }
+        }
+        if best == 0 {
+            return RefindAlignment {
+                distance: 0,
+                start: last_end - matcher.length,
+                end: last_end,
+                terminal_insertions: 0,
+            };
+        }
+        matcher.recover_banded(
+            target,
+            best,
+            first_end,
+            last_end,
+            &mut RefindScratch::default(),
+        )
+    }
+
+    #[test]
+    #[ignore = "manual release-mode synthetic timing; not a whole-pipeline benchmark"]
+    fn refind_kernel_timing() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+        let mut seed = 0x783c_1bfe_943du64;
+        for (label, length, window, change_every) in [
+            ("near-match", 1200, 12000, 50),
+            ("divergent-match", 1200, 12000, 5),
+            ("unrelated", 1200, 12000, 0),
+            ("long-divergent", 3000, 16000, 5),
+        ] {
+            let query = random_sequence(length, b"ACGT", &mut seed);
+            let mut target = random_sequence(window, b"ACGT", &mut seed);
+            if change_every != 0 {
+                let offset = window / 3;
+                target[offset..offset + length].copy_from_slice(&query);
+                for position in (offset..offset + length).step_by(change_every) {
+                    target[position] = match target[position] {
+                        b'A' => b'C',
+                        b'C' => b'G',
+                        b'G' => b'T',
+                        _ => b'A',
+                    };
+                }
+            }
+            let target = [vec![b'E'; length / 2], target, vec![b'E'; length / 2]].concat();
+            let matcher = RefindMatcher::new(&query).unwrap();
+            let mut scratch = RefindScratch::default();
+            assert_eq!(
+                matcher.align_with_scratch(&target, &mut scratch).unwrap(),
+                scalar_recovery_comparator(&matcher, &target)
+            );
+            let mut scalar = Vec::new();
+            let mut optimized = Vec::new();
+            for round in 0..7 {
+                for old in if round % 2 == 0 {
+                    [true, false]
+                } else {
+                    [false, true]
+                } {
+                    let start = Instant::now();
+                    for _ in 0..4 {
+                        if old {
+                            black_box(scalar_recovery_comparator(
+                                black_box(&matcher),
+                                black_box(&target),
+                            ));
+                        } else {
+                            black_box(matcher.align_with_scratch(black_box(&target), &mut scratch));
+                        }
+                    }
+                    if old {
+                        scalar.push(start.elapsed());
+                    } else {
+                        optimized.push(start.elapsed());
+                    }
+                }
+            }
+            scalar.sort();
+            optimized.sort();
+            let per_call = |duration: Duration| duration.as_secs_f64() * 1000.0 / 4.0;
+            eprintln!(
+                "{label}: scalar_recovery_ms={:.3} optimized_ms={:.3} ratio={:.2}x",
+                per_call(scalar[3]),
+                per_call(optimized[3]),
+                scalar[3].as_secs_f64() / optimized[3].as_secs_f64()
+            );
+        }
+    }
+
+    fn full_refind(query: &[u8], target: &[u8]) -> Option<RefindAlignment> {
+        if query.is_empty() || target.is_empty() {
+            return None;
+        }
+        let matcher = RefindMatcher::new(query)?;
+        let mut best = usize::MAX;
+        let mut first_end = 0;
+        let mut last_end = 0;
+        for (end, distance) in matcher.matcher.find_all_end(target, query.len()) {
+            if distance < best {
+                best = distance;
+                first_end = end + 1;
+                last_end = end + 1;
+            } else if distance == best {
+                last_end = end + 1;
+            }
+        }
+        if best == usize::MAX {
+            return None;
+        }
+        if best == 0 {
+            return Some(RefindAlignment {
+                distance: 0,
+                start: last_end - query.len(),
+                end: last_end,
+                terminal_insertions: 0,
+            });
+        }
+        let find_start = |end: usize| {
+            let cap = best + 1;
+            let mut previous: Vec<usize> = (0..=query.len()).map(|i| i.min(cap)).collect();
+            let mut current = vec![cap; query.len() + 1];
+            let mut start = None;
+            for j in 1..=end.min(query.len().saturating_add(best)) {
+                current.fill(cap);
+                current[0] = j.min(cap);
+                for i in j.saturating_sub(best).max(1)..=j.saturating_add(best).min(query.len()) {
+                    let diagonal = previous[i - 1]
+                        + usize::from(!refind_equal(query[query.len() - i], target[end - j]));
+                    current[i] = diagonal
+                        .min(previous[i] + 1)
+                        .min(current[i - 1] + 1)
+                        .min(cap);
+                }
+                if current[query.len()] == best {
+                    start = Some(end - j);
+                }
+                std::mem::swap(&mut previous, &mut current);
+            }
+            start.expect("optimal alignment has a start")
+        };
+        let start = find_start(last_end);
+        let first_start = if first_end == last_end {
+            start
+        } else {
+            find_start(first_end)
+        };
+        let first_target = &target[first_start..first_end];
+        let width = first_target.len();
+        let cap = best + 1;
+        let mut previous: Vec<usize> = (0..=width).map(|j| j.min(cap)).collect();
+        let mut current = vec![cap; width + 1];
+        let mut paths = vec![0u8; (query.len() + 1) * (width + 1)];
+        for i in 1..=query.len() {
+            current.fill(cap);
+            current[0] = i.min(cap);
+            paths[i * (width + 1)] = 1;
+            for j in i.saturating_sub(best).max(1)..=i.saturating_add(best).min(width) {
+                let insertion = previous[j] + 1;
+                let deletion = current[j - 1] + 1;
+                let diagonal =
+                    previous[j - 1] + usize::from(!refind_equal(query[i - 1], first_target[j - 1]));
+                current[j] = insertion.min(deletion).min(diagonal).min(cap);
+                paths[i * (width + 1) + j] = if current[j] == insertion {
+                    1
+                } else if current[j] == deletion {
+                    2
+                } else {
+                    0
+                };
+            }
+            std::mem::swap(&mut previous, &mut current);
+        }
+        let (mut i, mut j) = (query.len(), width);
+        let mut operations = Vec::new();
+        while i > 0 || j > 0 {
+            let op = if i == 0 {
+                2
+            } else {
+                paths[i * (width + 1) + j]
+            };
+            operations.push(op);
+            match op {
+                0 => {
+                    i -= 1;
+                    j -= 1;
+                }
+                1 => i -= 1,
+                _ => j -= 1,
+            }
+        }
+        Some(RefindAlignment {
+            distance: best,
+            start,
+            end: last_end,
+            terminal_insertions: operations.iter().take_while(|&&op| op == 1).count()
+                + operations.iter().rev().take_while(|&&op| op == 1).count(),
+        })
+    }
+
+    #[test]
+    fn banded_refind_matches_full_traceback() {
+        let mut sequences = vec![Vec::new()];
+        for length in 1..=4 {
+            for mut code in 0..3_usize.pow(length) {
+                let mut sequence = Vec::new();
+                for _ in 0..length {
+                    sequence.push(b"ACN"[code % 3]);
+                    code /= 3;
+                }
+                sequences.push(sequence);
+            }
+        }
+        for query in &sequences {
+            let matcher = RefindMatcher::new(query);
+            for target in &sequences {
+                let actual = matcher.as_ref().and_then(|matcher| matcher.align(target));
+                assert_eq!(
+                    actual,
+                    full_refind(query, target),
+                    "query={query:?}, target={target:?}"
+                );
+            }
+        }
+        for length in [63, 64, 65, 127, 128, 129, 257] {
+            let query: Vec<_> = (0..length)
+                .map(|i| b"ACGTNE"[(i * 7 + i / 3) % 6])
+                .collect();
+            let mut target = b"GGTTA".to_vec();
+            target.extend(&query);
+            target[length / 2] = b'C';
+            target.remove(length / 3);
+            target.insert(length / 4, b'T');
+            target.extend(b"CCA");
+            let matcher = RefindMatcher::new(&query).unwrap();
+            assert_eq!(matcher.align(&target), full_refind(&query, &target));
+        }
+    }
 
     fn full_table_alignment(query: &[u8], target: &[u8], limit: usize) -> AlignmentResult {
         let m = query.len();

@@ -225,6 +225,7 @@ fn refound_short_copies_stay_members_but_cannot_replace_annotated_reference() ->
     )?;
     assert_eq!(choice.choice.dna, back_translate(&full));
     assert_eq!(choice.exact_samples, 2);
+    assert_eq!(choice.excluded_refound_short, 1);
     assert_eq!(calls.len(), 12);
     Ok(())
 }
@@ -282,6 +283,7 @@ fn fragment_models_use_one_existing_family_locus_on_either_strand() -> Result<()
         assert_eq!(selected.choice.selection, "joined_fragments");
         assert_eq!(selected.choice.dna, back_translate(&full));
         assert_eq!(selected.exact_samples, 0);
+        assert_eq!(selected.excluded_refound_short, 0);
         assert_eq!(selected.sources, ["head", "tail"]);
     }
     for separate_contig in [false, true] {

@@ -219,6 +219,8 @@ fn main() -> Result<()> {
 }
 
 fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Result<()> {
+    let pipeline_started = Instant::now();
+    let mut timings = Vec::new();
     let outdir = args.out_dir.to_string_lossy().to_string();
     let outdir_path = args.out_dir.as_path();
 
@@ -257,6 +259,7 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
             Ok(genes.len())
         })
         .collect::<Result<_>>()?;
+    timings.push(("GFF processing", stage_started.elapsed()));
     log::info!(
         "Processed {} genomes, {} genes, {} threads in {:.3}s",
         all_genes.len(),
@@ -267,6 +270,7 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
 
     // Step 2: Run CD-HIT clustering
     log::info!("Step 2: Clustering sequences with CD-HIT...");
+    let clustering_started = Instant::now();
     cdhit::check_cdhit_version("cd-hit")?;
 
     // Combine all protein sequences for clustering
@@ -299,9 +303,14 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
         "Initial clustering completed in {:.3}s",
         stage_started.elapsed().as_secs_f64()
     );
+    timings.push((
+        "Initial clustering and input combination",
+        clustering_started.elapsed(),
+    ));
 
     // Step 3: Generate initial network
     log::info!("Step 3: Generating pangenome network...");
+    let stage_started = Instant::now();
     let cluster_file = outdir_path.join("cd-hit_output.fasta.clstr");
     let data_file = outdir_path.join("gene_data.csv");
 
@@ -340,17 +349,20 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
         graph.node_count(),
         graph.edge_count()
     );
+    timings.push(("Initial network generation", stage_started.elapsed()));
 
     // Step 4: Clean network
     log::info!("Step 4: Cleaning network...");
 
     let stage_started = Instant::now();
     clean_network::collapse_paralogs(&mut graph, &centroid_context)?;
+    timings.push(("Paralog context collapse", stage_started.elapsed()));
     log::info!(
         "Paralog context collapse completed in {:.3}s",
         stage_started.elapsed().as_secs_f64()
     );
 
+    let family_started = Instant::now();
     let stage_started = Instant::now();
     let dna_index = family_index::FamilyIndex::build(
         &graph,
@@ -360,6 +372,8 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
         args.threads,
         true,
     )?;
+    timings.push(("DNA similarity index", stage_started.elapsed()));
+    let stage_started = Instant::now();
     clean_network::collapse_families_indexed(
         &mut graph,
         &seqid_to_centroid,
@@ -369,7 +383,9 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
         true,
         args.length_outlier_support_proportion,
     )?;
+    timings.push(("DNA family collapse", stage_started.elapsed()));
     let family_threshold = rustaroo_args.family_threshold.unwrap_or(0.7);
+    let stage_started = Instant::now();
     let protein_index = family_index::FamilyIndex::build(
         &graph,
         &outdir,
@@ -378,6 +394,8 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
         args.threads,
         false,
     )?;
+    timings.push(("Protein similarity index", stage_started.elapsed()));
+    let stage_started = Instant::now();
     clean_network::collapse_families_indexed(
         &mut graph,
         &seqid_to_centroid,
@@ -387,15 +405,18 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
         false,
         args.length_outlier_support_proportion,
     )?;
+    timings.push(("Protein family collapse", stage_started.elapsed()));
 
     // Trim trailing ends after correcting mistranslations and families.
+    let stage_started = Instant::now();
     let min_support = rustaroo_args.min_trailing_support.unwrap_or(3);
     let max_recursive = rustaroo_args.trailing_recursive.unwrap_or(2);
     clean_network::trim_low_support_trailing_ends(&mut graph, min_support, max_recursive)?;
+    timings.push(("Trailing-end trimming", stage_started.elapsed()));
 
     log::info!(
         "Family cleaning completed in {:.3}s",
-        stage_started.elapsed().as_secs_f64()
+        family_started.elapsed().as_secs_f64()
     );
 
     log::info!(
@@ -407,6 +428,7 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
     // Step 5: Find missing genes
     if args.refind_mode != RefindMode::Off {
         log::info!("Step 5: Finding missing genes...");
+        let refind_started = Instant::now();
         let stage_started = Instant::now();
         let dna_file = outdir_path.join("combined_DNA_CDS.fasta");
         find_missing::find_missing(
@@ -415,15 +437,37 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
             data_file.to_str().unwrap(),
             dna_file.to_str().unwrap(),
             prot_seq_file,
-            args.search_radius,
-            args.refind_prop_match,
-            0.99,
-            0.7,
-            !args.quiet,
+            &find_missing::RefindOptions {
+                search_radius: args.search_radius,
+                prop_match: args.refind_prop_match,
+                pairwise_id_thresh: rustaroo_args.id.unwrap_or(0.98),
+                merge_id_thresh: family_threshold.max(0.8),
+                remove_by_consensus: rustaroo_args.remove_by_consensus.unwrap_or(false),
+                only_valid_genes: args.refind_mode == RefindMode::Strict,
+                verbose: !args.quiet,
+            },
         )?;
+        timings.push(("Missing-gene refinding", stage_started.elapsed()));
+        let stage_started = Instant::now();
+        clean_network::collapse_families_indexed(
+            &mut graph,
+            &seqid_to_centroid,
+            &protein_index,
+            &[1, 2, 3],
+            args.quiet,
+            false,
+            args.length_outlier_support_proportion,
+        )?;
+        timings.push(("Post-refinding family collapse", stage_started.elapsed()));
+        let stage_started = Instant::now();
+        clean_network::clean_misassembly_edges(
+            &mut graph,
+            rustaroo_args.edge_support_threshold.unwrap_or(0),
+        );
+        timings.push(("Misassembly edge cleaning", stage_started.elapsed()));
         log::info!(
             "Missing-gene search completed in {:.3}s",
-            stage_started.elapsed().as_secs_f64()
+            refind_started.elapsed().as_secs_f64()
         );
     }
 
@@ -440,6 +484,7 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
             core_threshold,
             args.quiet,
         )?;
+        timings.push(("Core gene alignment", stage_started.elapsed()));
         log::info!(
             "Core alignment completed in {:.3}s",
             stage_started.elapsed().as_secs_f64()
@@ -448,6 +493,7 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
 
     // Step 7: Generate output files
     log::info!("Step 7: Generating output files...");
+    let output_started = Instant::now();
     let stage_started = Instant::now();
 
     // Create isolate mapping
@@ -470,8 +516,10 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
         &orig_ids,
         &outdir,
     )?;
+    timings.push(("Presence/absence output", stage_started.elapsed()));
 
     // Generate pan-genome reference
+    let stage_started = Instant::now();
     output::generate_pan_genome_reference(
         &graph,
         data_file.to_str().unwrap(),
@@ -479,19 +527,36 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
         &family_names,
         &outdir,
     )?;
+    timings.push(("Reference generation", stage_started.elapsed()));
 
     // Write GML graph
+    let stage_started = Instant::now();
     let gml_file = outdir_path.join("final_graph.gml");
     output::write_gml(&graph, gml_file.to_str().unwrap())?;
 
     // Write summary statistics
     output::write_summary_stats(&graph, &outdir, all_genes.len())?;
+    timings.push(("Graph and summary output", stage_started.elapsed()));
 
     log::info!("Generated presence/absence matrix, reference, and graph files");
     log::info!(
         "Output generation completed in {:.3}s",
-        stage_started.elapsed().as_secs_f64()
+        output_started.elapsed().as_secs_f64()
     );
+
+    let total = pipeline_started.elapsed();
+    let measured: std::time::Duration = timings.iter().map(|(_, elapsed)| *elapsed).sum();
+    timings.push(("Other pipeline overhead", total.saturating_sub(measured)));
+    log::info!("Timing breakdown (wall time):");
+    for (name, elapsed) in timings {
+        log::info!(
+            "  {:<40} {:>10.3}s ({:>5.1}%)",
+            name,
+            elapsed.as_secs_f64(),
+            100.0 * elapsed.as_secs_f64() / total.as_secs_f64()
+        );
+    }
+    log::info!("Pipeline total: {:.3}s", total.as_secs_f64());
 
     Ok(())
 }

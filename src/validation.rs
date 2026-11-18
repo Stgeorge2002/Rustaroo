@@ -59,6 +59,27 @@ pub fn unescape(text: &str) -> String {
     .to_string()
 }
 
+/// Escape text using standard XML/named character references.
+pub fn escape_xml(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => result.push_str("&amp;"),
+            '<' => result.push_str("&lt;"),
+            '>' => result.push_str("&gt;"),
+            '"' => result.push_str("&quot;"),
+            '\'' => result.push_str("&apos;"),
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
+/// Replace standard XML/named and numeric character references.
+pub fn unescape_xml(text: &str) -> String {
+    unescape(text)
+}
+
 /// Validate that a file exists
 pub fn is_valid_file(path: &str) -> Result<String> {
     if !Path::new(path).exists() {

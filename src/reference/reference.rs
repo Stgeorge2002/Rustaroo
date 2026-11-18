@@ -530,22 +530,31 @@ fn refuse_private_extensions<'a>(
 ) -> Census {
     let private_below = extension_support(n_samples);
     let mut extending_copies: HashMap<usize, u32> = HashMap::default();
-    let mut judged: Vec<(&Allele, bool, usize)> = Vec::with_capacity(kept.len());
+    let protein_by_allele: std::collections::BTreeMap<*const Allele, &[u8]> = intact
+        .iter()
+        .zip(proteins)
+        .map(|(&allele, protein)| (allele as *const Allele, protein.as_slice()))
+        .chain(
+            joined
+                .iter()
+                .map(|(allele, protein)| (*allele as *const Allele, protein.as_slice())),
+        )
+        .collect();
+    let mut judged = Vec::with_capacity(kept.len());
     for allele in kept.iter().copied() {
-        let protein = protein_of(allele, intact, proteins, joined);
+        let protein = protein_by_allele[&(allele as *const Allele)];
         let extends = extends_past(&end.anchor, protein);
         if extends {
             *extending_copies.entry(protein.len()).or_default() += allele.count;
         }
-        judged.push((allele, extends, protein.len()));
+        judged.push((extends, protein.len()));
     }
     let extension_samples = extending_copies.values().sum();
     let before = kept.len();
-    kept.retain(|allele| {
-        judged.iter().any(|(item, extends, length)| {
-            std::ptr::eq(*item, *allele)
-                && !(*extends && extending_copies.get(length).copied().unwrap_or(0) < private_below)
-        })
+    let mut judged = judged.into_iter();
+    kept.retain(|_| {
+        let (extends, length) = judged.next().expect("each kept allele was judged");
+        !(extends && extending_copies.get(&length).copied().unwrap_or(0) < private_below)
     });
     Census {
         active: true,
