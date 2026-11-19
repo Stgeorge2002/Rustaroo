@@ -88,6 +88,7 @@ fn all_members_not_just_centroids_choose_references_without_changing_pangenome()
         GeneEdge {
             size: 1,
             members: BTreeSet::from([0]),
+            ..GeneEdge::default()
         },
     );
     let before = snapshot(&graph)?;

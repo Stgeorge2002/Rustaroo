@@ -99,6 +99,10 @@ struct Args {
     #[arg(long = "refind-mode", default_value = "default")]
     refind_mode: RefindMode,
 
+    /// Break equal-support refinding overlaps by node creation order, newest first
+    #[arg(long)]
+    refind_creation_order: bool,
+
     /// Minimum cluster size to keep trailing genes
     #[arg(long)]
     min_trailing_support: Option<usize>,
@@ -356,6 +360,7 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
 
     let stage_started = Instant::now();
     clean_network::collapse_paralogs(&mut graph, &centroid_context)?;
+    drop(centroid_context);
     timings.push(("Paralog context collapse", stage_started.elapsed()));
     log::info!(
         "Paralog context collapse completed in {:.3}s",
@@ -383,6 +388,7 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
         true,
         args.length_outlier_support_proportion,
     )?;
+    drop(dna_index);
     timings.push(("DNA family collapse", stage_started.elapsed()));
     let family_threshold = rustaroo_args.family_threshold.unwrap_or(0.7);
     let stage_started = Instant::now();
@@ -444,6 +450,7 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
                 merge_id_thresh: family_threshold.max(0.8),
                 remove_by_consensus: rustaroo_args.remove_by_consensus.unwrap_or(false),
                 only_valid_genes: args.refind_mode == RefindMode::Strict,
+                creation_order_ties: args.refind_creation_order,
                 verbose: !args.quiet,
             },
         )?;

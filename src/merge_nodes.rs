@@ -1,12 +1,31 @@
 //! Node merging utilities for graph manipulation
 //!
 
-use crate::network::Graph;
-use crate::network::{GeneEdge, GeneNode};
+use crate::network::{add_ordered_edge, ordered_edges, GeneEdge, GeneNode, Graph};
 use anyhow::{Context, Result};
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use std::collections::HashSet;
+
+pub(crate) fn next_creation_order(graph: &Graph<GeneNode, GeneEdge>) -> usize {
+    graph
+        .node_weights()
+        .map(|node| node.creation_order)
+        .max()
+        .map_or(0, |id| id + 1)
+}
+
+pub(crate) fn merge_node_in_creation_order(
+    graph: &mut Graph<GeneNode, GeneEdge>,
+    cluster: &[NodeIndex],
+    next_order: &mut usize,
+    multi_centroid: bool,
+) -> Result<NodeIndex> {
+    let node = merge_node_cluster(graph, cluster, NodeIndex::new(0), multi_centroid)?;
+    graph[node].creation_order = *next_order;
+    *next_order += 1;
+    Ok(node)
+}
 
 /// Merge multiple nodes into a single new node
 pub fn merge_node_cluster(
@@ -87,34 +106,27 @@ pub fn merge_node_cluster(
     }
 
     // Collect edges to neighbors (not within cluster)
-    let mut neighbor_edges: std::collections::HashMap<NodeIndex, GeneEdge> =
-        std::collections::HashMap::new();
+    let mut neighbor_positions = std::collections::HashMap::<NodeIndex, usize>::new();
+    let mut neighbor_edges = Vec::<(NodeIndex, GeneEdge)>::new();
+    let mut adjacency = Vec::new();
 
     for &node_idx in &cluster {
-        if graph.node_weight(node_idx).is_none() {
-            continue;
-        }
-
-        use petgraph::visit::EdgeRef;
-        for edge in graph.edges(node_idx) {
-            let neighbor = if edge.source() == node_idx {
-                edge.target()
-            } else {
-                edge.source()
-            };
-
-            // Skip edges within the cluster
+        ordered_edges(graph, node_idx, &mut adjacency);
+        for &(_, edge, neighbor) in &adjacency {
             if cluster_set.contains(&neighbor) {
                 continue;
             }
-
-            neighbor_edges
-                .entry(neighbor)
-                .and_modify(|e| {
-                    e.members.extend(edge.weight().members.iter());
-                    e.size = e.members.len();
-                })
-                .or_insert_with(|| edge.weight().clone());
+            match neighbor_positions.entry(neighbor) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(neighbor_edges.len());
+                    neighbor_edges.push((neighbor, graph[edge].clone()));
+                }
+                std::collections::hash_map::Entry::Occupied(slot) => {
+                    let data = &mut neighbor_edges[*slot.get()].1;
+                    data.members.extend(graph[edge].members.iter());
+                    data.size = data.members.len();
+                }
+            }
         }
     }
 
@@ -123,7 +135,7 @@ pub fn merge_node_cluster(
     // Add edges to neighbors
     for (neighbor, edge_data) in neighbor_edges {
         if graph.node_weight(neighbor).is_some() {
-            graph.add_edge(actual_idx, neighbor, edge_data);
+            add_ordered_edge(graph, actual_idx, neighbor, edge_data);
         }
     }
     for &node_idx in &cluster {
@@ -243,12 +255,14 @@ fn connect_neighbours(
                 data.members.insert(member);
                 data.size = data.members.len();
             } else {
-                graph.add_edge(
+                add_ordered_edge(
+                    graph,
                     first,
                     second,
                     GeneEdge {
                         size: 1,
                         members: std::collections::BTreeSet::from([member]),
+                        ..GeneEdge::default()
                     },
                 );
             }
@@ -303,6 +317,7 @@ mod tests {
             GeneEdge {
                 size: 2,
                 members: BTreeSet::from([0, 1]),
+                ..GeneEdge::default()
             },
         );
         graph.add_edge(
@@ -311,6 +326,7 @@ mod tests {
             GeneEdge {
                 size: 1,
                 members: BTreeSet::from([0]),
+                ..GeneEdge::default()
             },
         );
         graph.add_edge(
@@ -319,6 +335,7 @@ mod tests {
             GeneEdge {
                 size: 1,
                 members: BTreeSet::from([1]),
+                ..GeneEdge::default()
             },
         );
         graph.add_edge(
@@ -327,6 +344,7 @@ mod tests {
             GeneEdge {
                 size: 1,
                 members: BTreeSet::from([2]),
+                ..GeneEdge::default()
             },
         );
         remove_member_from_node(&mut graph, center, 0).unwrap();
@@ -360,6 +378,7 @@ mod tests {
             GeneEdge {
                 size: 1,
                 members: BTreeSet::from([0]),
+                ..GeneEdge::default()
             },
         );
         graph.add_edge(
@@ -368,6 +387,7 @@ mod tests {
             GeneEdge {
                 size: 2,
                 members: BTreeSet::from([0, 1]),
+                ..GeneEdge::default()
             },
         );
         graph.add_edge(
@@ -376,6 +396,7 @@ mod tests {
             GeneEdge {
                 size: 1,
                 members: BTreeSet::from([1]),
+                ..GeneEdge::default()
             },
         );
         delete_node(&mut graph, center).unwrap();
@@ -418,6 +439,7 @@ mod tests {
                 GeneEdge {
                     size: members.len(),
                     members: members.into_iter().collect(),
+                    ..GeneEdge::default()
                 },
             );
         }

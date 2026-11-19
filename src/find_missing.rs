@@ -1,18 +1,22 @@
 //! Missing-gene sequence search in neighboring annotation windows.
 
-use crate::alignment::{RefindMatcher, RefindScratch};
+use crate::alignment::{RefindAlignment, RefindMatcher, RefindScratch};
 use crate::network::Graph;
 use crate::network::{GeneEdge, GeneNode};
 use crate::prokka::{reverse_complement, translate};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use indicatif::{ProgressBar, ProgressStyle};
+use parking_lot::Mutex;
 use petgraph::graph::NodeIndex;
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::hash_map::RandomState;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
+use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,6 +28,7 @@ pub struct RefindOptions {
     pub merge_id_thresh: f64,
     pub remove_by_consensus: bool,
     pub only_valid_genes: bool,
+    pub creation_order_ties: bool,
     pub verbose: bool,
 }
 
@@ -64,40 +69,55 @@ pub fn find_missing(
         ProgressBar::hidden()
     };
 
-    let stage_started = Instant::now();
-    let cache = RefindCache::default();
-    let genome_hits: Result<Vec<_>> = gff_files
+    let search_started = Instant::now();
+    let cache = RefindCache::new(ALIGNMENT_CACHE_BUDGET);
+    let hits: Result<Vec<_>> = gff_files
         .par_iter()
         .enumerate()
-        .map(
-            |(member_idx, gff_file)| match search_list.get(&member_idx) {
-                Some(searches) => search_gff_file(
-                    gff_file,
-                    searches,
-                    &merged_sequences,
-                    member_idx,
-                    options,
-                    Some(&progress),
-                    &cache,
-                )
-                .with_context(|| format!("Missing-gene search failed for {}", gff_file)),
-                _ => Ok(GenomeHits::default()),
-            },
-        )
+        .map(|(member, file)| match search_list.get(&member) {
+            Some(searches) => search_gff_file(
+                file,
+                searches,
+                &merged_sequences,
+                member,
+                options,
+                Some(&progress),
+                &cache,
+            )
+            .with_context(|| format!("Missing-gene search failed for {file}")),
+            None => Ok(GenomeHits::default()),
+        })
         .collect();
-    let mut genome_hits = match genome_hits {
+    let mut genome_hits = match hits {
         Ok(hits) => hits,
         Err(error) => {
             progress.abandon_with_message("search failed");
             return Err(error);
         }
     };
-    progress.finish_with_message("searches complete");
+    let stats = cache.alignments.stats();
     drop(cache);
-    let search_elapsed = stage_started.elapsed();
+    let search_elapsed = search_started.elapsed();
+    log::info!(
+        "Refind search single-pass:{}: wall {:.3}s; {} hits, {} misses, {} evictions",
+        ALIGNMENT_CACHE_MIB,
+        search_elapsed.as_secs_f64(),
+        stats.hits,
+        stats.misses,
+        stats.evictions
+    );
+    progress.finish_with_message("searches complete");
+    drop(search_list);
+    drop(id_to_gff);
+    drop(merged_sequences);
 
     let stage_started = Instant::now();
-    filter_conflicts(graph, &mut genome_hits, options.remove_by_consensus)?;
+    filter_conflicts(
+        graph,
+        &mut genome_hits,
+        options.remove_by_consensus,
+        options.creation_order_ties,
+    )?;
     let filtering_elapsed = stage_started.elapsed();
 
     let stage_started = Instant::now();
@@ -209,31 +229,66 @@ struct SearchHit {
     strand: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ConflictLocation {
+    contig: String,
+    start: usize,
+    end: usize,
+}
+
 #[derive(Default)]
-struct GenomeSearch {
-    searches: Vec<GeneSearch>,
-    conflicts: BTreeSet<(NodeIndex, String)>,
+struct GenomeSearch<'a> {
+    searches: Vec<GeneSearch<'a>>,
+    conflicts: BTreeSet<(NodeIndex, &'a str)>,
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
 struct GenomeHits {
     hits: Vec<(NodeIndex, SearchHit)>,
-    locations: BTreeMap<NodeIndex, SearchHit>,
+    locations: BTreeMap<NodeIndex, ConflictLocation>,
 }
 
-struct GeneSearch {
+struct GeneSearch<'a> {
     node: NodeIndex,
-    sequence: String,
-    anchors: BTreeSet<String>,
+    sequence: &'a str,
+    anchors: BTreeSet<&'a str>,
 }
 
-#[derive(Default)]
+const MIB: usize = 1024 * 1024;
+const ALIGNMENT_CACHE_MIB: usize = 512;
+const ALIGNMENT_CACHE_BUDGET: usize = ALIGNMENT_CACHE_MIB * MIB;
+const ALIGNMENT_CACHE_SHARDS: usize = 64;
+// Account conservatively for table/queue slots and the window allocation.
+const ALIGNMENT_ENTRY_OVERHEAD: usize = 256;
+
 struct RefindCache {
-    matchers: DashMap<String, Arc<RefindMatcher>>,
+    matchers: DashMap<String, Arc<CachedMatcher>>,
+    next_query_id: AtomicUsize,
+    alignments: AlignmentCache,
+}
+
+#[cfg(test)]
+impl Default for RefindCache {
+    fn default() -> Self {
+        Self::new(ALIGNMENT_CACHE_BUDGET)
+    }
+}
+
+struct CachedMatcher {
+    id: usize,
+    matcher: RefindMatcher,
 }
 
 impl RefindCache {
-    fn get(&self, sequence: &str) -> Option<Arc<RefindMatcher>> {
+    fn new(budget: usize) -> Self {
+        Self {
+            matchers: DashMap::new(),
+            next_query_id: AtomicUsize::new(0),
+            alignments: AlignmentCache::new(budget),
+        }
+    }
+
+    fn get(&self, sequence: &str) -> Option<Arc<CachedMatcher>> {
         if sequence.is_empty() {
             return None;
         }
@@ -244,10 +299,125 @@ impl RefindCache {
             self.matchers
                 .entry(sequence.to_string())
                 .or_insert_with(|| {
-                    Arc::new(RefindMatcher::new(sequence.as_bytes()).expect("query is nonempty"))
+                    Arc::new(CachedMatcher {
+                        id: self.next_query_id.fetch_add(1, Ordering::Relaxed),
+                        matcher: RefindMatcher::new(sequence.as_bytes())
+                            .expect("query is nonempty"),
+                    })
                 })
                 .value(),
         ))
+    }
+}
+
+struct CachedWindow {
+    query_id: usize,
+    target: Box<str>,
+    result: Option<RefindAlignment>,
+}
+
+#[derive(Default)]
+struct AlignmentShard {
+    windows: HashMap<u64, CachedWindow>,
+    fifo: VecDeque<u64>,
+    charged_bytes: usize,
+    hits: usize,
+    misses: usize,
+    evictions: usize,
+}
+
+#[derive(Default)]
+struct AlignmentStats {
+    hits: usize,
+    misses: usize,
+    evictions: usize,
+}
+
+struct AlignmentCache {
+    hasher: RandomState,
+    shards: [Mutex<AlignmentShard>; ALIGNMENT_CACHE_SHARDS],
+    shard_budget: usize,
+}
+
+impl AlignmentCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            hasher: RandomState::new(),
+            shards: std::array::from_fn(|_| Mutex::default()),
+            shard_budget: budget / ALIGNMENT_CACHE_SHARDS,
+        }
+    }
+
+    fn get_or_align(
+        &self,
+        query_id: usize,
+        target: &str,
+        align: impl FnOnce() -> Option<RefindAlignment>,
+    ) -> Option<RefindAlignment> {
+        let charge = target.len().saturating_add(ALIGNMENT_ENTRY_OVERHEAD);
+        if charge > self.shard_budget {
+            return align();
+        }
+        let key = self.hasher.hash_one((query_id, target));
+        self.get_or_align_hashed(key, query_id, target, align)
+    }
+
+    fn get_or_align_hashed(
+        &self,
+        key: u64,
+        query_id: usize,
+        target: &str,
+        align: impl FnOnce() -> Option<RefindAlignment>,
+    ) -> Option<RefindAlignment> {
+        let charge = target.len().saturating_add(ALIGNMENT_ENTRY_OVERHEAD);
+        debug_assert!(charge <= self.shard_budget);
+        let shard = &self.shards[key as usize % self.shards.len()];
+        {
+            let mut state = shard.lock();
+            if let Some(window) = state.windows.get(&key) {
+                if window.query_id == query_id && window.target.as_ref() == target {
+                    let result = window.result;
+                    state.hits += 1;
+                    return result;
+                }
+            }
+            state.misses += 1;
+        }
+
+        let result = align();
+        let mut state = shard.lock();
+        // A concurrent miss may already have populated the slot. Collisions
+        // also leave the existing entry alone; neither case changes the result.
+        if !state.windows.contains_key(&key) {
+            while state.charged_bytes > self.shard_budget - charge {
+                let oldest = state.fifo.pop_front().expect("charged cache is not empty");
+                let evicted = state.windows.remove(&oldest).expect("FIFO key is cached");
+                state.charged_bytes -= evicted.target.len() + ALIGNMENT_ENTRY_OVERHEAD;
+                state.evictions += 1;
+            }
+            state.windows.insert(
+                key,
+                CachedWindow {
+                    query_id,
+                    target: target.into(),
+                    result,
+                },
+            );
+            state.fifo.push_back(key);
+            state.charged_bytes += charge;
+        }
+        result
+    }
+
+    fn stats(&self) -> AlignmentStats {
+        let mut stats = AlignmentStats::default();
+        for shard in &self.shards {
+            let state = shard.lock();
+            stats.hits += state.hits;
+            stats.misses += state.misses;
+            stats.evictions += state.evictions;
+        }
+        stats
     }
 }
 
@@ -259,7 +429,7 @@ struct SearchScratch {
 
 fn search_gff_file(
     gff_file: &str,
-    search: &GenomeSearch,
+    search: &GenomeSearch<'_>,
     merged_sequences: &HashMap<(usize, NodeIndex), String>,
     member: usize,
     options: &RefindOptions,
@@ -338,24 +508,17 @@ fn search_gff_file(
     }
     let mut result = GenomeHits::default();
 
-    for (_, anchor) in &search.conflicts {
+    for &(_, anchor) in &search.conflicts {
         annotations
-            .get(anchor.as_str())
+            .get(anchor)
             .with_context(|| format!("Missing conflict annotation {} in {}", anchor, gff_file))?;
     }
     let conflicts: Vec<_> = search.conflicts.iter().collect();
     let locations: Vec<_> = conflicts
         .into_par_iter()
         .map_init(SearchScratch::default, |scratch, (node, anchor)| {
-            let &(contig_id, start, end) = &annotations[anchor.as_str()];
-            let mut location = SearchHit {
-                sequence: String::new(),
-                contig: contig_id.to_string(),
-                start: start - 1,
-                end,
-                strand: true,
-            };
-            if let Some(sequence) = merged_sequences.get(&(member, *node)) {
+            let &(contig_id, start, end) = &annotations[*anchor];
+            let location = if let Some(sequence) = merged_sequences.get(&(member, *node)) {
                 let (contig, reverse) = &contigs[contig_id];
                 let offset = start.saturating_sub(options.search_radius);
                 let window_end = end.saturating_add(options.search_radius).min(contig.len());
@@ -371,16 +534,30 @@ fn search_gff_file(
                         min_match,
                         options.merge_id_thresh,
                         contig_id,
+                        &cache.alignments,
                         scratch,
                     )
                 });
                 if let Some(found) = found {
-                    location = found;
+                    ConflictLocation {
+                        contig: found.contig,
+                        start: found.start,
+                        end: found.end,
+                    }
                 } else {
-                    location.start = offset;
-                    location.end = offset;
+                    ConflictLocation {
+                        contig: contig_id.to_string(),
+                        start: offset,
+                        end: offset,
+                    }
                 }
-            }
+            } else {
+                ConflictLocation {
+                    contig: contig_id.to_string(),
+                    start: start - 1,
+                    end,
+                }
+            };
             if let Some(progress) = progress {
                 progress.inc(1);
             }
@@ -392,8 +569,8 @@ fn search_gff_file(
     }
 
     for gene_search in &search.searches {
-        for anchor in &gene_search.anchors {
-            annotations.get(anchor.as_str()).with_context(|| {
+        for &anchor in &gene_search.anchors {
+            annotations.get(anchor).with_context(|| {
                 format!("Missing neighbor annotation {} in {}", anchor, gff_file)
             })?;
         }
@@ -405,11 +582,11 @@ fn search_gff_file(
         .map_init(SearchScratch::default, |scratch, gene_search| {
             let mut best_hit: Option<SearchHit> = None;
             let mut best_score = 0.0;
-            let matcher = cache.get(&gene_search.sequence);
+            let matcher = cache.get(gene_search.sequence);
             let mut windows = HashMap::with_capacity(gene_search.anchors.len());
 
-            for anchor in &gene_search.anchors {
-                let &(contig_id, start, end) = &annotations[anchor.as_str()];
+            for &anchor in &gene_search.anchors {
+                let &(contig_id, start, end) = &annotations[anchor];
                 let (contig_seq, rc_contig) = &contigs[contig_id];
                 let offset = start.saturating_sub(options.search_radius);
                 let window_end = end
@@ -420,7 +597,7 @@ fn search_gff_file(
                     .or_insert_with(|| {
                         matcher.as_ref().and_then(|matcher| {
                             search_prepared(
-                                &gene_search.sequence,
+                                gene_search.sequence,
                                 matcher,
                                 contig_seq,
                                 rc_contig,
@@ -429,6 +606,7 @@ fn search_gff_file(
                                 options.prop_match,
                                 options.pairwise_id_thresh,
                                 contig_id,
+                                &cache.alignments,
                                 scratch,
                             )
                         })
@@ -450,7 +628,7 @@ fn search_gff_file(
                     !options.only_valid_genes
                         || crate::validation::is_valid_gene(
                             &hit.sequence,
-                            &translate_refound(&gene_search.sequence),
+                            &translate_refound(gene_search.sequence),
                         )
                 })
                 .map(|hit| (gene_search.node, hit));
@@ -461,9 +639,16 @@ fn search_gff_file(
         })
         .collect();
 
-    for found in searched.into_iter().flatten() {
-        result.locations.insert(found.0, found.1.clone());
-        result.hits.push(found);
+    for (node, hit) in searched.into_iter().flatten() {
+        result.locations.insert(
+            node,
+            ConflictLocation {
+                contig: hit.contig.clone(),
+                start: hit.start,
+                end: hit.end,
+            },
+        );
+        result.hits.push((node, hit));
     }
 
     Ok(result)
@@ -480,7 +665,8 @@ fn search_both_strands(
     threshold: f64,
     contig_id: &str,
 ) -> Option<SearchHit> {
-    let matcher = RefindMatcher::new(query.as_bytes())?;
+    let cache = RefindCache::new(0);
+    let matcher = cache.get(query)?;
     search_prepared(
         query,
         &matcher,
@@ -491,13 +677,14 @@ fn search_both_strands(
         prop_match,
         threshold,
         contig_id,
+        &cache.alignments,
         &mut SearchScratch::default(),
     )
 }
 
 fn search_prepared(
     query: &str,
-    matcher: &RefindMatcher,
+    matcher: &CachedMatcher,
     contig: &str,
     reverse: &str,
     offset: usize,
@@ -505,6 +692,7 @@ fn search_prepared(
     prop_match: f64,
     threshold: f64,
     contig_id: &str,
+    cache: &AlignmentCache,
     scratch: &mut SearchScratch,
 ) -> Option<SearchHit> {
     if query.is_empty() || offset >= window_end {
@@ -522,28 +710,42 @@ fn search_prepared(
     let mut best = None;
     let mut best_score = 0.0;
     for (strand, target) in targets.iter().enumerate() {
-        scratch.padded.clear();
-        scratch.padded.extend(std::iter::repeat('E').take(padding));
-        scratch.padded.push_str(target);
-        scratch.padded.extend(std::iter::repeat('E').take(padding));
-        let padded = &scratch.padded;
-        let Some(alignment) = matcher.align_with_scratch(padded.as_bytes(), &mut scratch.alignment)
-        else {
+        let mut prepared = false;
+        let Some(alignment) = cache.get_or_align(matcher.id, target, || {
+            pad_target(&mut scratch.padded, target, padding);
+            prepared = true;
+            matcher
+                .matcher
+                .align_with_scratch(scratch.padded.as_bytes(), &mut scratch.alignment)
+        }) else {
             continue;
         };
-        let mut variants = vec![Cow::Borrowed(padded.as_str())];
-        if padded.contains("NNNNNNNNNNNNNNNNNNNN") {
-            for pattern in [&*PREFIX, &*SUFFIX] {
-                variants.push(
-                    pattern.replace(padded.as_str(), |caps: &regex::Captures<'_>| {
-                        "X".repeat(caps[0].len())
-                    }),
-                );
+        let masked = target.contains("NNNNNNNNNNNNNNNNNNNN");
+        let (base, start, end) =
+            if !masked && alignment.start >= padding && alignment.end <= padding + target.len() {
+                (*target, alignment.start - padding, alignment.end - padding)
+            } else {
+                if !prepared {
+                    pad_target(&mut scratch.padded, target, padding);
+                }
+                (scratch.padded.as_str(), alignment.start, alignment.end)
+            };
+        let mut variants = [
+            Cow::Borrowed(base),
+            Cow::Borrowed(base),
+            Cow::Borrowed(base),
+        ];
+        let count = if masked {
+            for (variant, pattern) in variants[1..].iter_mut().zip([&*PREFIX, &*SUFFIX]) {
+                *variant =
+                    pattern.replace(base, |caps: &regex::Captures<'_>| "X".repeat(caps[0].len()));
             }
-        }
-        for variant in variants {
-            let variant = variant.as_ref();
-            let segment = &variant[alignment.start..alignment.end];
+            3
+        } else {
+            1
+        };
+        for variant in &variants[..count] {
+            let segment = &variant[start..end];
             let n_x = segment.bytes().filter(|&b| b == b'X').count();
             let n_e = segment.bytes().filter(|&b| b == b'E').count();
             let length = segment.len() - n_x - n_e;
@@ -563,7 +765,8 @@ fn search_prepared(
             let (start, end) = if strand == 0 {
                 (alignment.start, alignment.end)
             } else {
-                (padded.len() - alignment.end, padded.len() - alignment.start)
+                let padded_len = target.len() + 2 * padding;
+                (padded_len - alignment.end, padded_len - alignment.start)
             };
             let sequence = segment
                 .replace(['X', 'E'], "N")
@@ -580,6 +783,13 @@ fn search_prepared(
         }
     }
     best
+}
+
+fn pad_target(padded: &mut String, target: &str, padding: usize) {
+    padded.clear();
+    padded.extend(std::iter::repeat('E').take(padding));
+    padded.push_str(target);
+    padded.extend(std::iter::repeat('E').take(padding));
 }
 
 /// Map clustering identifiers to original annotation identifiers.
@@ -614,11 +824,11 @@ pub fn load_annotation_ids(gene_data_file: &str) -> Result<HashMap<String, Strin
     Ok(id_to_gff)
 }
 
-fn build_search_list(
-    graph: &Graph<GeneNode, GeneEdge>,
-    id_to_gff: &HashMap<String, String>,
-) -> Result<HashMap<usize, GenomeSearch>> {
-    let mut search_list: HashMap<usize, GenomeSearch> = HashMap::new();
+fn build_search_list<'a>(
+    graph: &'a Graph<GeneNode, GeneEdge>,
+    id_to_gff: &'a HashMap<String, String>,
+) -> Result<HashMap<usize, GenomeSearch<'a>>> {
+    let mut search_list: HashMap<usize, GenomeSearch<'a>> = HashMap::new();
     let mut seen = HashMap::new();
 
     for node_idx in graph.node_indices() {
@@ -652,19 +862,19 @@ fn build_search_list(
                     .get(seq_id)
                     .with_context(|| format!("Missing original annotation ID for {}", seq_id))?;
                 let genome = search_list.entry(member).or_default();
-                genome.conflicts.insert((neighbor_idx, gff_id.clone()));
+                genome.conflicts.insert((neighbor_idx, gff_id.as_str()));
                 if !node.members.contains(&member) {
                     let searches = &mut genome.searches;
                     let position = *seen.entry((node_idx, member)).or_insert_with(|| {
                         let position = searches.len();
                         searches.push(GeneSearch {
                             node: node_idx,
-                            sequence: query_seq.clone(),
+                            sequence: query_seq,
                             anchors: BTreeSet::new(),
                         });
                         position
                     });
-                    searches[position].anchors.insert(gff_id.clone());
+                    searches[position].anchors.insert(gff_id.as_str());
                 }
             }
         }
@@ -777,9 +987,17 @@ fn filter_conflicts(
     graph: &mut Graph<GeneNode, GeneEdge>,
     genomes: &mut [GenomeHits],
     remove_by_consensus: bool,
+    creation_order_ties: bool,
 ) -> Result<()> {
     let mut priority: Vec<_> = graph.node_indices().collect();
-    priority.sort_by_key(|&node| std::cmp::Reverse((graph[node].size, node.index())));
+    priority.sort_by_key(|&node| {
+        let tie = if creation_order_ties {
+            graph[node].creation_order
+        } else {
+            node.index()
+        };
+        std::cmp::Reverse((graph[node].size, tie, node.index()))
+    });
     let rank: HashMap<_, _> = priority
         .into_iter()
         .enumerate()
@@ -918,6 +1136,80 @@ mod tests {
     }
 
     #[test]
+    fn alignment_cache_requires_exact_keys_and_evicts_within_budget() {
+        let target = "ACTG";
+        let budget = ALIGNMENT_ENTRY_OVERHEAD + target.len();
+        let cache = AlignmentCache::new(ALIGNMENT_CACHE_SHARDS * budget);
+        let first = Some(RefindAlignment {
+            distance: 0,
+            start: 2,
+            end: 6,
+            terminal_insertions: 0,
+        });
+        assert_eq!(cache.get_or_align_hashed(0, 0, target, || first), first);
+        assert_eq!(cache.get_or_align_hashed(0, 0, "ACAG", || None), None);
+        assert_eq!(cache.get_or_align_hashed(0, 1, target, || None), None);
+        assert_eq!(
+            cache.get_or_align_hashed(0, 0, target, || panic!("exact repeat should hit")),
+            first
+        );
+        // A second key on the same shard displaces the first, even for a
+        // cached no-alignment result.
+        let second_key = ALIGNMENT_CACHE_SHARDS as u64;
+        assert_eq!(
+            cache.get_or_align_hashed(second_key, 1, target, || None),
+            None
+        );
+        assert_eq!(
+            cache.get_or_align_hashed(second_key, 1, target, || panic!("None should hit")),
+            None
+        );
+        let state = cache.shards[0].lock();
+        assert!(!state.windows.contains_key(&0));
+        assert_eq!(state.charged_bytes, budget);
+        assert_eq!((state.hits, state.misses, state.evictions), (2, 4, 1));
+    }
+
+    #[test]
+    fn alignment_cache_preserves_strand_masks_and_relative_coordinates() {
+        let uncached = RefindCache::new(0);
+        let cached = RefindCache::default();
+        for (query, window) in [
+            ("ATGAAATAG", "TTTATGAAATAGCCCCATGAAATAGGG"),
+            ("ATGAAATAG", "CCCCTATTTCATGGG"),
+            ("ATGAAATAG", "ATGAAA"),
+            ("ATGAAATAG", "ATGAAATAGNNNNNNNNNNNNNNNNNNNNATGAAATAG"),
+        ] {
+            let search = |cache: &RefindCache, prefix: &str, prop_match: f64, threshold: f64| {
+                let contig = format!("{prefix}{window}CCCC");
+                let reverse = reverse_complement(&contig);
+                search_prepared(
+                    query,
+                    &cache.get(query).unwrap(),
+                    &contig,
+                    &reverse,
+                    prefix.len(),
+                    prefix.len() + window.len(),
+                    prop_match,
+                    threshold,
+                    prefix,
+                    &cache.alignments,
+                    &mut SearchScratch::default(),
+                )
+            };
+            assert_eq!(
+                search(&cached, "A", 0.2, 0.8),
+                search(&uncached, "A", 0.2, 0.8)
+            );
+            let expected = search(&uncached, "GGGG", 0.5, 0.98);
+            assert!(expected.is_some());
+            assert_eq!(search(&cached, "GGGG", 0.5, 0.98), expected);
+        }
+        let hits: usize = cached.alignments.shards.iter().map(|s| s.lock().hits).sum();
+        assert!(hits >= 8);
+    }
+
+    #[test]
     fn parallel_conflicts_and_searches_preserve_results_and_progress() -> Result<()> {
         let dir = tempfile::TempDir::new()?;
         let gff = dir.path().join("isolate.gff");
@@ -927,20 +1219,20 @@ mod tests {
         let merged = NodeIndex::new(9);
         let search = GenomeSearch {
             conflicts: BTreeSet::from([
-                (unchanged, "first".into()),
-                (unchanged, "last".into()),
-                (merged, "first".into()),
-                (merged, "last".into()),
+                (unchanged, "first"),
+                (unchanged, "last"),
+                (merged, "first"),
+                (merged, "last"),
             ]),
             searches: (0..16)
                 .map(|node| GeneSearch {
                     node: NodeIndex::new(20 + node),
                     sequence: if node % 2 == 0 {
-                        "ATGAAATAG".into()
+                        "ATGAAATAG"
                     } else {
-                        "CCCCCCCCC".into()
+                        "CCCCCCCCC"
                     },
-                    anchors: BTreeSet::from(["first".into(), "last".into()]),
+                    anchors: BTreeSet::from(["first", "last"]),
                 })
                 .collect(),
         };
@@ -952,6 +1244,7 @@ mod tests {
             merge_id_thresh: 0.8,
             remove_by_consensus: false,
             only_valid_genes: false,
+            creation_order_ties: false,
             verbose: false,
         };
         let cache = RefindCache::default();
@@ -961,7 +1254,7 @@ mod tests {
                 ..options
             };
             let mut expected = None;
-            for threads in [1, 4] {
+            for (threads, cache) in [(1, &RefindCache::new(0)), (4, &cache)] {
                 let progress = ProgressBar::hidden();
                 let result = rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
@@ -974,7 +1267,7 @@ mod tests {
                             0,
                             &strict_options,
                             Some(&progress),
-                            &cache,
+                            cache,
                         )
                     })?;
                 assert_eq!(progress.position(), 20);
@@ -995,7 +1288,15 @@ mod tests {
         Ok(())
     }
 
-    fn location(contig: &str, start: usize, end: usize) -> SearchHit {
+    fn location(contig: &str, start: usize, end: usize) -> ConflictLocation {
+        ConflictLocation {
+            contig: contig.into(),
+            start,
+            end,
+        }
+    }
+
+    fn hit(contig: &str, start: usize, end: usize) -> SearchHit {
         SearchHit {
             sequence: "A".repeat(end - start),
             contig: contig.into(),
@@ -1050,23 +1351,69 @@ mod tests {
                 GeneEdge {
                     size: 1,
                     members: BTreeSet::from([0]),
+                    ..GeneEdge::default()
                 },
             );
         }
         let mut genomes = vec![GenomeHits {
-            hits: vec![(high, location("contig", 0, 10))],
+            hits: vec![(high, hit("contig", 0, 10))],
             locations: BTreeMap::from([
                 (low, location("contig", 0, 10)),
                 (high, location("contig", 0, 10)),
             ]),
         }];
-        filter_conflicts(&mut graph, &mut genomes, false)?;
+        filter_conflicts(&mut graph, &mut genomes, false, false)?;
         assert!(graph.node_weight(low).is_none());
         assert_eq!(genomes[0].hits.len(), 1);
         let edge = graph
             .find_edge(left, right)
             .context("Missing replacement edge")?;
         assert_eq!(graph[edge].members, BTreeSet::from([0]));
+        Ok(())
+    }
+
+    #[test]
+    fn creation_order_breaks_overlap_ties_when_a_graph_slot_is_reused() -> Result<()> {
+        let mut graph = Graph::default();
+        let vacancy = graph.add_node(GeneNode::default());
+        let mut add_family = |member, creation_order| {
+            graph.add_node(GeneNode {
+                size: 1,
+                creation_order,
+                members: BTreeSet::from([member]),
+                lengths: vec![10],
+                ..Default::default()
+            })
+        };
+        let left = add_family(0, 1);
+        let right = add_family(1, 2);
+        let older = add_family(0, 3);
+        graph[older].members.insert(2);
+        graph[older].size = 2;
+        graph.remove_node(vacancy);
+        let mut next_order = crate::merge_nodes::next_creation_order(&graph);
+        let newer = crate::merge_nodes::merge_node_in_creation_order(
+            &mut graph,
+            &[left, right],
+            &mut next_order,
+            true,
+        )?;
+        assert_eq!(newer, vacancy);
+        assert!(newer.index() < older.index());
+
+        for (use_creation_order, winner, loser) in [(false, older, newer), (true, newer, older)] {
+            let mut graph = graph.clone();
+            let mut genomes = [GenomeHits {
+                hits: vec![],
+                locations: BTreeMap::from([
+                    (older, location("contig", 0, 10)),
+                    (newer, location("contig", 0, 10)),
+                ]),
+            }];
+            filter_conflicts(&mut graph, &mut genomes, false, use_creation_order)?;
+            assert!(graph[winner].members.contains(&0));
+            assert!(!graph[loser].members.contains(&0));
+        }
         Ok(())
     }
 
@@ -1088,8 +1435,8 @@ mod tests {
         let mut genomes: Vec<_> = (0..2)
             .map(|_| GenomeHits {
                 hits: vec![
-                    (rejected, location("first", 0, 10)),
-                    (retained, location("second", 0, 10)),
+                    (rejected, hit("first", 0, 10)),
+                    (retained, hit("second", 0, 10)),
                 ],
                 locations: BTreeMap::from([
                     (rejected, location("first", 0, 10)),
@@ -1097,7 +1444,7 @@ mod tests {
                 ]),
             })
             .collect();
-        filter_conflicts(&mut graph, &mut genomes, true)?;
+        filter_conflicts(&mut graph, &mut genomes, true, false)?;
         assert!(graph.node_weight(rejected).is_none());
         assert!(graph.node_weight(retained).is_some());
         Ok(())
@@ -1183,6 +1530,7 @@ mod tests {
             GeneEdge {
                 size: 0,
                 members: Default::default(),
+                ..GeneEdge::default()
             },
         );
         let ids = HashMap::from([
@@ -1194,7 +1542,7 @@ mod tests {
         assert_eq!(searches[&0].searches.len(), 1);
         assert_eq!(
             searches[&0].searches[0].anchors,
-            BTreeSet::from(["first".into(), "second".into()])
+            BTreeSet::from(["first", "second"])
         );
         assert_eq!(searches[&1].searches.len(), 1);
         Ok(())
@@ -1234,6 +1582,7 @@ mod tests {
             GeneEdge {
                 size: 0,
                 members: Default::default(),
+                ..GeneEdge::default()
             },
         );
         find_missing(
@@ -1249,6 +1598,7 @@ mod tests {
                 merge_id_thresh: 0.8,
                 remove_by_consensus: false,
                 only_valid_genes: false,
+                creation_order_ties: false,
                 verbose: false,
             },
         )?;
@@ -1289,8 +1639,8 @@ mod tests {
         std::fs::write(&gff, format!("##gff-version 3\ncontig\ttest\tCDS\t1\t3\t.\t+\t0\tID=far\ncontig\ttest\tCDS\t75\t77\t.\t+\t0\tID=near\n##FASTA\n>contig\n{sequence}\n"))?;
         let search = GeneSearch {
             node: petgraph::graph::NodeIndex::new(0),
-            sequence: "ATGAAATAG".into(),
-            anchors: BTreeSet::from(["far".into()]),
+            sequence: "ATGAAATAG",
+            anchors: BTreeSet::from(["far"]),
         };
         let options = RefindOptions {
             search_radius: 20,
@@ -1299,6 +1649,7 @@ mod tests {
             merge_id_thresh: 0.8,
             remove_by_consensus: false,
             only_valid_genes: false,
+            creation_order_ties: false,
             verbose: false,
         };
         assert!(search_gff_file(
@@ -1317,8 +1668,8 @@ mod tests {
         .is_empty());
         let search = GeneSearch {
             node: petgraph::graph::NodeIndex::new(0),
-            sequence: "ATGAAATAG".into(),
-            anchors: BTreeSet::from(["far".into(), "near".into()]),
+            sequence: "ATGAAATAG",
+            anchors: BTreeSet::from(["far", "near"]),
         };
         let hits = search_gff_file(
             gff.to_str().unwrap(),
@@ -1348,16 +1699,16 @@ mod tests {
             &gff,
             "##gff-version 3\ncontig\ttest\tCDS\t1\t3\t.\t+\t0\tID=anchor\n##FASTA\n>contig\nATGAAATAG\n",
         )?;
-        let anchors = BTreeSet::from(["anchor".to_string()]);
+        let anchors = BTreeSet::from(["anchor"]);
         let searches = vec![
             GeneSearch {
                 node: NodeIndex::new(4),
-                sequence: "ATGAAATAG".into(),
+                sequence: "ATGAAATAG",
                 anchors: anchors.clone(),
             },
             GeneSearch {
                 node: NodeIndex::new(2),
-                sequence: "ATGAAATAG".into(),
+                sequence: "ATGAAATAG",
                 anchors,
             },
         ];
@@ -1378,6 +1729,7 @@ mod tests {
                 merge_id_thresh: 0.8,
                 remove_by_consensus: false,
                 only_valid_genes: false,
+                creation_order_ties: false,
                 verbose: false,
             },
             Some(&progress),

@@ -19,11 +19,33 @@ quirk. Handling of ambiguity codes other than `N` is not guaranteed to match
 Biopython. Overall output agreement and performance have not been established, and
 this development copy should not be treated as a validated replacement.
 
+Use `--refind-creation-order` to break equal-support overlap ties in favor of
+the newer node, rather than the higher graph slot. This follows Panaroo's
+tie-break policy without changing which windows are aligned.
+
+Graph cleaning uses stable logical node IDs rather than recycled Petgraph
+slots to schedule neighbourhood centres. Merges retain first-seen adjacency
+order, and equal-copy paralog reference ties use the first logical occurrence.
+These ordering rules can change family membership; they do not emulate Python
+set iteration or change clustering thresholds.
+
 Refinding shares immutable query matchers across genomes and reuses alignment
-and padding buffers within parallel workers. Endpoint searches widen an exact
-edit-distance bound until a match exists, without changing acceptance thresholds.
-Start recovery and traceback use 64-bit global-alignment blocks for wider edit
-bands, retaining scalar banded recovery for very narrow bands. First/last optimal
+and padding buffers within parallel workers. A per-run alignment cache with a
+512 MiB entry budget reuses exact query/oriented-window matches, including
+across genomes. It stores window-relative alignments; acceptance, tie handling,
+and translation are unchanged. The cache grows as entries are added and is
+released before conflict filtering. Refinding logs report search wall time,
+cache hits, misses, and evictions.
+
+Conflict filtering stores only
+contig coordinates; selected hits keep their sequences separately for output.
+Search tasks borrow representative sequences and annotation IDs; search inputs are
+released before conflict filtering. A single-pass Myers scan tightens the
+edit-distance bound as it finds better endpoints, retaining ties without
+changing acceptance thresholds.
+Start recovery and traceback use 64-bit global-alignment blocks with compact
+byte-match tables for wider edit bands, retaining scalar banded recovery for
+very narrow bands. First/last optimal
 endpoints and the existing traceback tie priorities are preserved by design and
 checked against the scalar implementation on synthetic inputs. Conflict-location
 searches also run in parallel, with results replayed in their original order.

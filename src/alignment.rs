@@ -1,10 +1,11 @@
 //! Sequence alignment utilities using edlib-style algorithms
 
 use bio::pattern_matching::myers::long::Myers;
+#[cfg(test)]
 use bio::pattern_matching::myers::MyersBuilder;
 use once_cell::sync::OnceCell;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RefindAlignment {
     pub distance: usize,
     pub start: usize,
@@ -21,6 +22,7 @@ fn refind_equal(a: u8, b: u8) -> bool {
 pub(crate) struct RefindMatcher {
     query: Vec<u8>,
     length: usize,
+    #[cfg(test)]
     matcher: Myers<u64>,
     forward: OnceCell<GlobalPattern>,
     reverse: OnceCell<GlobalPattern>,
@@ -33,53 +35,63 @@ struct GlobalState {
     distance: usize,
 }
 
-struct GlobalBlock {
-    equal: [u64; 256],
+struct GlobalPattern {
+    slots: [u16; 256],
+    masks: Vec<u64>,
+    boundaries: Vec<u64>,
     length: usize,
 }
 
-struct GlobalPattern {
-    blocks: Vec<GlobalBlock>,
-}
-
 impl GlobalPattern {
-    fn new(query: impl Iterator<Item = u8>) -> Self {
-        let mut blocks = Vec::new();
-        for base in query {
-            if blocks
-                .last()
-                .map_or(true, |block: &GlobalBlock| block.length == 64)
-            {
-                blocks.push(GlobalBlock {
-                    equal: [0; 256],
-                    length: 0,
-                });
-            }
-            let block = blocks.last_mut().expect("query has a block");
-            let bit = 1u64 << block.length;
-            block.equal[base as usize] |= bit;
+    fn new(query: impl ExactSizeIterator<Item = u8> + Clone) -> Self {
+        fn matching_bytes(base: u8) -> impl Iterator<Item = u8> {
             let equivalents: &[u8] = match base {
                 b'A' | b'C' | b'G' | b'T' => b"NE",
                 b'N' | b'E' => b"ACGT",
                 _ => b"",
             };
-            for &symbol in equivalents {
-                block.equal[symbol as usize] |= bit;
-            }
-            block.length += 1;
+            std::iter::once(base).chain(equivalents.iter().copied())
         }
-        Self { blocks }
+
+        let length = query.len();
+        let block_count = length.div_ceil(64);
+        // Slot zero matches nothing. Other slots retain literal matches even
+        // for bytes outside the usual DNA alphabet.
+        let mut slots = [0; 256];
+        let mut slot_count = 1;
+        for symbol in query.clone().flat_map(matching_bytes) {
+            let slot = &mut slots[usize::from(symbol)];
+            if *slot == 0 {
+                *slot = slot_count;
+                slot_count += 1;
+            }
+        }
+        let mut masks = vec![0; usize::from(slot_count) * block_count];
+        for (i, base) in query.enumerate() {
+            let bit = 1u64 << (i % 64);
+            for symbol in matching_bytes(base) {
+                let slot = usize::from(slots[usize::from(symbol)]);
+                masks[slot * block_count + i / 64] |= bit;
+            }
+        }
+        let boundaries = (0..block_count)
+            .map(|block| 1u64 << ((length - block * 64).min(64) - 1))
+            .collect();
+        Self {
+            slots,
+            masks,
+            boundaries,
+            length,
+        }
     }
 
     fn reset(&self, states: &mut Vec<GlobalState>) {
         states.clear();
-        let mut distance = 0;
-        for block in &self.blocks {
-            distance += block.length;
+        for block in 0..self.boundaries.len() {
             states.push(GlobalState {
                 positive: u64::MAX,
                 negative: 0,
-                distance,
+                distance: ((block + 1) * 64).min(self.length),
             });
         }
     }
@@ -88,26 +100,33 @@ impl GlobalPattern {
         // A global alignment charges for every target prefix: the top row
         // increases by one, unlike the free-prefix HW endpoint search.
         let mut carry = 1i8;
-        for (block, state) in self.blocks.iter().zip(states.iter_mut()) {
-            let equal = block.equal[base as usize];
-            let vertical = equal | state.negative;
-            let equal = equal | u64::from(carry < 0);
-            let horizontal =
-                ((equal & state.positive).wrapping_add(state.positive) ^ state.positive) | equal;
-            let mut positive = state.negative | !(horizontal | state.positive);
-            let mut negative = state.positive & horizontal;
-            let boundary = 1u64 << (block.length - 1);
-            let next_carry =
-                i8::from(positive & boundary != 0) - i8::from(negative & boundary != 0);
-            state.distance = state.distance.wrapping_add_signed(next_carry as isize);
-            positive = (positive << 1) | u64::from(carry > 0);
-            negative = (negative << 1) | u64::from(carry < 0);
-            state.positive = negative | !(vertical | positive);
-            state.negative = positive & vertical;
-            carry = next_carry;
+        let block_count = self.boundaries.len();
+        let start = usize::from(self.slots[usize::from(base)]) * block_count;
+        let masks = &self.masks[start..start + block_count];
+        for ((&equal, &boundary), state) in
+            masks.iter().zip(&self.boundaries).zip(states.iter_mut())
+        {
+            carry = advance_refind_block(state, equal, boundary, carry);
         }
         states.last().expect("nonempty query").distance
     }
+}
+
+#[inline]
+fn advance_refind_block(state: &mut GlobalState, equal: u64, boundary: u64, carry: i8) -> i8 {
+    let vertical = equal | state.negative;
+    let equal = equal | u64::from(carry < 0);
+    let horizontal =
+        ((equal & state.positive).wrapping_add(state.positive) ^ state.positive) | equal;
+    let mut positive = state.negative | !(horizontal | state.positive);
+    let mut negative = state.positive & horizontal;
+    let next_carry = i8::from(positive & boundary != 0) - i8::from(negative & boundary != 0);
+    state.distance = state.distance.wrapping_add_signed(next_carry as isize);
+    positive = (positive << 1) | u64::from(carry > 0);
+    negative = (negative << 1) | u64::from(carry < 0);
+    state.positive = negative | !(vertical | positive);
+    state.negative = positive & vertical;
+    next_carry
 }
 
 #[derive(Default)]
@@ -130,14 +149,14 @@ impl RefindScratch {
             return row;
         }
         let block = (row - 1) / 64;
-        let state = self.columns[(column - 1) * pattern.blocks.len() + block];
+        let state = self.columns[(column - 1) * pattern.boundaries.len() + block];
         let local_row = (row - 1) % 64 + 1;
         let above = if local_row == 64 {
             0
         } else {
             u64::MAX << local_row
         };
-        let used = u64::MAX >> (64 - pattern.blocks[block].length);
+        let used = u64::MAX >> (64 - (pattern.length - block * 64).min(64));
         let mask = above & used;
         state.distance + (state.negative & mask).count_ones() as usize
             - (state.positive & mask).count_ones() as usize
@@ -149,16 +168,19 @@ impl RefindMatcher {
         if query.is_empty() {
             return None;
         }
-        let mut builder = MyersBuilder::new();
-        for base in b"ACGT" {
-            builder.ambig(*base, b"NE");
-        }
-        builder.ambig(b'N', b"ACGT");
-        builder.ambig(b'E', b"ACGT");
         Some(Self {
             query: query.to_vec(),
             length: query.len(),
-            matcher: builder.build_long_64(query),
+            #[cfg(test)]
+            matcher: {
+                let mut builder = MyersBuilder::new();
+                for base in b"ACGT" {
+                    builder.ambig(*base, b"NE");
+                }
+                builder.ambig(b'N', b"ACGT");
+                builder.ambig(b'E', b"ACGT");
+                builder.build_long_64(query)
+            },
             forward: OnceCell::new(),
             reverse: OnceCell::new(),
         })
@@ -169,7 +191,7 @@ impl RefindMatcher {
         self.align_with_scratch(target, &mut RefindScratch::default())
     }
 
-    pub fn align_with_scratch(
+    pub(crate) fn align_with_scratch(
         &self,
         target: &[u8],
         scratch: &mut RefindScratch,
@@ -177,40 +199,98 @@ impl RefindMatcher {
         if target.is_empty() {
             return None;
         }
-        let mut best = usize::MAX;
-        let mut first_end = 0;
-        let mut last_end = 0;
-        let mut limit = (self.length / 32).max(1).min(self.length);
-        loop {
-            for (end, distance) in self.matcher.find_all_end(target, limit) {
-                if distance < best {
-                    best = distance;
-                    first_end = end + 1;
-                    last_end = end + 1;
-                } else if distance == best {
-                    last_end = end + 1;
+        let (best, first_end, last_end) = self.single_pass_endpoints(target, scratch)?;
+        Some(self.recover(target, best, first_end, last_end, scratch))
+    }
+
+    fn single_pass_endpoints(
+        &self,
+        target: &[u8],
+        scratch: &mut RefindScratch,
+    ) -> Option<(usize, usize, usize)> {
+        let pattern = self
+            .forward
+            .get_or_init(|| GlobalPattern::new(self.query.iter().copied()));
+        pattern.reset(&mut scratch.states);
+        let states = &mut scratch.states;
+        let blocks = states.len();
+        let mut active = blocks;
+        let mut bound = self.length;
+        let mut first = 0;
+        let mut last = 0;
+        for (index, &base) in target.iter().enumerate() {
+            let offset = usize::from(pattern.slots[usize::from(base)]) * blocks;
+            let equalities = &pattern.masks[offset..offset + blocks];
+            // HW starts a new target substring for free at each column.
+            let mut carry = 0;
+            for ((state, &equal), &boundary) in states[..active]
+                .iter_mut()
+                .zip(equalities)
+                .zip(&pattern.boundaries)
+            {
+                carry = advance_refind_block(state, equal, boundary, carry);
+            }
+            if active < blocks
+                && states[active - 1]
+                    .distance
+                    .wrapping_add_signed(-isize::from(carry))
+                    <= bound
+                && (equalities[active] & 1 != 0 || carry < 0)
+            {
+                // The next block can only re-enter through this boundary.
+                let width = (self.length - active * 64).min(64);
+                states[active] = GlobalState {
+                    positive: u64::MAX,
+                    negative: 0,
+                    distance: (states[active - 1].distance + width)
+                        .wrapping_add_signed(-isize::from(carry)),
+                };
+                advance_refind_block(
+                    &mut states[active],
+                    equalities[active],
+                    pattern.boundaries[active],
+                    carry,
+                );
+                active += 1;
+            }
+            if active == blocks {
+                let distance = states[blocks - 1].distance;
+                if distance <= bound {
+                    if first == 0 || distance < bound {
+                        first = index + 1;
+                    }
+                    last = index + 1;
+                    bound = distance;
                 }
             }
-            if best != usize::MAX {
-                break;
+            // Only drop trailing blocks with no row at or below the bound.
+            while active > 1 && states[active - 1].distance >= bound + 64 {
+                active -= 1;
             }
-            if limit == self.length {
-                return None;
-            }
-            limit = limit.saturating_mul(4).min(self.length);
         }
+        (first != 0).then_some((bound, first, last))
+    }
+
+    fn recover(
+        &self,
+        target: &[u8],
+        best: usize,
+        first_end: usize,
+        last_end: usize,
+        scratch: &mut RefindScratch,
+    ) -> RefindAlignment {
         if best == 0 {
-            return Some(RefindAlignment {
+            return RefindAlignment {
                 distance: 0,
                 start: last_end - self.length,
                 end: last_end,
                 terminal_insertions: 0,
-            });
+            };
         }
         // Very narrow scalar bands cost less than visiting every 64-bit block.
         let blocks = (self.length - 1) / 64 + 1;
         if best.saturating_mul(2).saturating_add(1) < blocks.saturating_mul(4) {
-            return Some(self.recover_banded(target, best, first_end, last_end, scratch));
+            return self.recover_banded(target, best, first_end, last_end, scratch);
         }
         let forward = self
             .forward
@@ -238,7 +318,7 @@ impl RefindMatcher {
         let width = first_target.len();
         forward.reset(&mut scratch.states);
         scratch.columns.clear();
-        scratch.columns.reserve(width * forward.blocks.len());
+        scratch.columns.reserve(width * forward.boundaries.len());
         for &base in first_target {
             forward.advance(&mut scratch.states, base);
             scratch.columns.extend_from_slice(&scratch.states);
@@ -266,12 +346,12 @@ impl RefindMatcher {
                 }
             }
         }
-        Some(RefindAlignment {
+        RefindAlignment {
             distance: best,
             start,
             end: last_end,
             terminal_insertions: trailing + leading,
-        })
+        }
     }
 
     fn recover_banded(
@@ -558,6 +638,80 @@ mod tests {
                 alphabet[*state as usize % alphabet.len()]
             })
             .collect()
+    }
+
+    #[test]
+    fn single_pass_matches_full_scan_across_blocks_and_ties() {
+        let mut seed = 0x2d98_039f_b369_a3acu64;
+        let mut scratch = RefindScratch::default();
+        for case in 0..1800 {
+            let length = [1, 2, 63, 64, 65, 127, 128, 129, 256, 511, 1024][case % 11];
+            let alphabet: &[u8] = if case % 2 == 0 { b"ACGT" } else { b"ACGTNEX" };
+            let query = random_sequence(length, alphabet, &mut seed);
+            let mut target = random_sequence(length * 3 + 7, alphabet, &mut seed);
+            match case % 7 {
+                0 => target.truncate(1),
+                1 => {
+                    target[..length].copy_from_slice(&query);
+                    target[2 * length..3 * length].copy_from_slice(&query);
+                }
+                2 => {
+                    target[..length].copy_from_slice(&query);
+                    target[2 * length..3 * length].copy_from_slice(&query);
+                    target[length / 2] = b'Z';
+                    target[2 * length + length / 2] = b'Z';
+                }
+                3 => drop(target.splice(0..0, vec![b'E'; length / 2])),
+                4 => target.extend(&query),
+                _ => {}
+            }
+            let matcher = RefindMatcher::new(&query).unwrap();
+            let mut expected = (usize::MAX, 0, 0);
+            for (end, distance) in matcher.matcher.find_all_end(&target, length) {
+                if distance < expected.0 {
+                    expected = (distance, end + 1, end + 1);
+                } else if distance == expected.0 {
+                    expected.2 = end + 1;
+                }
+            }
+            assert_eq!(
+                matcher.single_pass_endpoints(&target, &mut scratch),
+                Some(expected),
+                "case {case}"
+            );
+            if case < 220 {
+                assert_eq!(
+                    matcher.align_with_scratch(&target, &mut scratch),
+                    Some(scalar_recovery_comparator(&matcher, &target)),
+                    "recovered alignment for case {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_global_masks_preserve_matches_for_every_target_byte() {
+        let all_bytes: Vec<_> = (u8::MIN..=u8::MAX).collect();
+        let mut sparse_query = b"ACGTNEX".repeat(10);
+        sparse_query.push(b'A');
+        for query in [&sparse_query, &all_bytes] {
+            for query in [query.clone(), query.iter().rev().copied().collect()] {
+                let pattern = GlobalPattern::new(query.iter().copied());
+                let blocks = query.len().div_ceil(64);
+                for target in u8::MIN..=u8::MAX {
+                    let slot = usize::from(pattern.slots[usize::from(target)]);
+                    for (block, bases) in query.chunks(64).enumerate() {
+                        let expected = bases.iter().enumerate().fold(0, |mask, (i, &base)| {
+                            mask | (u64::from(refind_equal(base, target)) << i)
+                        });
+                        assert_eq!(pattern.masks[slot * blocks + block], expected);
+                    }
+                }
+                if query.len() == sparse_query.len() {
+                    assert_eq!(pattern.masks.len(), 8 * blocks);
+                }
+            }
+        }
     }
 
     #[test]

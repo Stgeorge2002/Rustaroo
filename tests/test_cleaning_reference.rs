@@ -90,6 +90,7 @@ fn high_degree_nonmerging_cleaning_terminates_and_preserves_graph() -> Result<()
             GeneEdge {
                 size: 0,
                 members: BTreeSet::new(),
+                ..GeneEdge::default()
             },
         );
     }

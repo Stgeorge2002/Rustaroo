@@ -360,6 +360,7 @@ mod tests {
             GeneEdge {
                 size: 1,
                 members: std::collections::BTreeSet::from([0]),
+                ..GeneEdge::default()
             },
         );
         write_gml(&graph, path.to_str().unwrap())?;

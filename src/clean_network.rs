@@ -3,10 +3,11 @@
 //! Port of core functions from rustaroo/clean_network.py
 
 use crate::family_index::FamilyIndex;
+use crate::merge_nodes::{merge_node_in_creation_order, next_creation_order};
 use crate::network::Graph;
-use crate::network::{GeneEdge, GeneNode};
+use crate::network::{ordered_edges, GeneEdge, GeneNode};
 use anyhow::Result;
-use petgraph::graph::NodeIndex;
+use petgraph::graph::{EdgeIndex, NodeIndex};
 use petgraph::visit::{EdgeRef, NodeIndexable};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Instant;
@@ -79,6 +80,20 @@ struct BfsScratch {
     queue: VecDeque<(NodeIndex, usize)>,
     edges: Vec<(NodeIndex, NodeIndex, usize)>,
     reached: Vec<NodeIndex>,
+    adjacency: Vec<Option<Vec<NodeIndex>>>,
+    edge_order: Vec<(u64, EdgeIndex, NodeIndex)>,
+}
+
+impl BfsScratch {
+    fn invalidate_merge(&mut self, graph: &Graph<GeneNode, GeneEdge>, merged: NodeIndex) {
+        // Only the merged node and the endpoints of its replacement edges
+        // can have stale adjacency. A reused node slot is invalidated too.
+        for node in std::iter::once(merged).chain(graph.neighbors(merged)) {
+            if let Some(entry) = self.adjacency.get_mut(node.index()) {
+                *entry = None;
+            }
+        }
+    }
 }
 
 fn mod_bfs_edges_with_scratch(
@@ -93,6 +108,7 @@ fn mod_bfs_edges_with_scratch(
     scratch.reached.clear();
     if scratch.visited_generation.len() < graph.node_bound() {
         scratch.visited_generation.resize(graph.node_bound(), 0);
+        scratch.adjacency.resize_with(graph.node_bound(), || None);
     }
     scratch.generation = scratch.generation.wrapping_add(1);
     if scratch.generation == 0 {
@@ -104,7 +120,15 @@ fn mod_bfs_edges_with_scratch(
     scratch.queue.push_back((source, depth_limit));
 
     while let Some((parent, depth_now)) = scratch.queue.pop_front() {
-        for child in graph.neighbors(parent) {
+        let neighbors = scratch.adjacency[parent.index()].get_or_insert_with(|| {
+            ordered_edges(graph, parent, &mut scratch.edge_order);
+            scratch
+                .edge_order
+                .iter()
+                .map(|&(_, _, node)| node)
+                .collect()
+        });
+        for &child in neighbors.iter() {
             if scratch.visited_generation[child.index()] != scratch.generation {
                 scratch.visited_generation[child.index()] = scratch.generation;
                 if record_edges {
@@ -124,6 +148,7 @@ fn mod_bfs_edges_with_scratch(
 #[cfg(test)]
 mod bfs_tests {
     use super::*;
+    use crate::network::add_ordered_edge;
 
     #[test]
     fn misassembly_cleaning_respects_support_and_fraction_boundaries() {
@@ -162,6 +187,7 @@ mod bfs_tests {
                 GeneEdge {
                     size,
                     members: BTreeSet::new(),
+                    ..GeneEdge::default()
                 },
             );
         }
@@ -185,6 +211,7 @@ mod bfs_tests {
                 GeneEdge {
                     size: 1,
                     members: BTreeSet::new(),
+                    ..GeneEdge::default()
                 },
             );
         }
@@ -200,6 +227,44 @@ mod bfs_tests {
 
         let second = mod_bfs_edges_with_scratch(&graph, nodes[3], Some(1), true, &mut scratch);
         assert_eq!(second.len(), 3);
+    }
+
+    #[test]
+    fn bfs_preserves_first_seen_edges_after_a_merge() -> Result<()> {
+        let mut graph = Graph::default();
+        let [first, second, shared, right, left] =
+            std::array::from_fn(|_| graph.add_node(GeneNode::default()));
+        for (from, to, member) in [
+            (first, shared, 0),
+            (right, first, 0),
+            (second, left, 1),
+            (shared, second, 1),
+        ] {
+            add_ordered_edge(
+                &mut graph,
+                from,
+                to,
+                GeneEdge {
+                    size: 1,
+                    members: BTreeSet::from([member]),
+                    ..GeneEdge::default()
+                },
+            );
+        }
+        let mut scratch = BfsScratch::default();
+        mod_bfs_edges_with_scratch(&graph, shared, Some(1), false, &mut scratch);
+        assert_eq!(scratch.reached, [first, second]);
+
+        let merged = merge_node_in_creation_order(&mut graph, &[first, second], &mut 1, true)?;
+        scratch.invalidate_merge(&graph, merged);
+        mod_bfs_edges_with_scratch(&graph, shared, Some(1), false, &mut scratch);
+        assert_eq!(scratch.reached, [merged]);
+        mod_bfs_edges_with_scratch(&graph, merged, Some(1), false, &mut scratch);
+        assert_eq!(scratch.reached, [shared, right, left]);
+        let edge = graph.find_edge(merged, shared).unwrap();
+        assert_eq!(graph[edge].members, BTreeSet::from([0, 1]));
+        assert_eq!(graph[edge].size, 2);
+        Ok(())
     }
 }
 
@@ -302,6 +367,7 @@ pub fn collapse_families_indexed(
     dna: bool,
     outlier_support: f64,
 ) -> Result<()> {
+    let mut next_order = next_creation_order(graph);
     let mut node_members: HashMap<NodeIndex, HashMap<usize, HashSet<usize>>> = HashMap::new();
     for node in graph.node_indices() {
         let mut members = HashMap::<usize, HashSet<usize>>::new();
@@ -330,7 +396,10 @@ pub fn collapse_families_indexed(
             println!("Processing depth: {}", depth);
         }
 
-        let mut search_space: BTreeSet<_> = graph.node_indices().collect();
+        let mut search_space: BTreeSet<_> = graph
+            .node_indices()
+            .map(|node| logical_node_key(graph, node))
+            .collect();
         let mut iteration_num = 1;
 
         while !search_space.is_empty() {
@@ -343,10 +412,10 @@ pub fn collapse_families_indexed(
             let mut neighborhood_nodes = 0usize;
             let mut merges = 0usize;
 
-            let temp_node_list: Vec<_> = search_space.iter().cloned().collect();
+            let temp_node_list: Vec<_> = search_space.iter().copied().collect();
             let mut removed_nodes = HashSet::new();
 
-            for node in temp_node_list {
+            for key @ (_, node) in temp_node_list {
                 if removed_nodes.contains(&node) || graph.node_weight(node).is_none() {
                     continue;
                 }
@@ -358,7 +427,7 @@ pub fn collapse_families_indexed(
                     .sum();
                 if degree <= 2 {
                     if !removed_nodes.contains(&node) {
-                        search_space.remove(&node);
+                        search_space.remove(&key);
                     }
                     removed_nodes.insert(node);
                     continue;
@@ -402,14 +471,16 @@ pub fn collapse_families_indexed(
 
                     if no_conflict {
                         merges += 1;
-                        merge_family_cluster(
+                        let merged = merge_family_cluster(
                             graph,
                             &cluster,
                             &mut node_members,
                             &mut search_space,
                             &mut removed_nodes,
+                            &mut next_order,
                             !dna,
                         )?;
+                        bfs_scratch.invalidate_merge(graph, merged);
                     } else {
                         let mut cluster = cluster;
                         cluster.sort_by_key(|&node| std::cmp::Reverse(graph[node].size));
@@ -443,14 +514,16 @@ pub fn collapse_families_indexed(
                                 for component in index.clusters(graph, &subset)? {
                                     if component.len() > 1 {
                                         merges += 1;
-                                        merge_family_cluster(
+                                        let merged = merge_family_cluster(
                                             graph,
                                             &component,
                                             &mut node_members,
                                             &mut search_space,
                                             &mut removed_nodes,
+                                            &mut next_order,
                                             !dna,
                                         )?;
+                                        bfs_scratch.invalidate_merge(graph, merged);
                                     }
                                 }
                             }
@@ -460,7 +533,7 @@ pub fn collapse_families_indexed(
                     }
                 }
                 if !removed_nodes.contains(&node) {
-                    search_space.remove(&node);
+                    search_space.remove(&key);
                 }
             }
 
@@ -493,10 +566,11 @@ fn merge_family_cluster(
     graph: &mut Graph<GeneNode, GeneEdge>,
     cluster: &[NodeIndex],
     node_members: &mut HashMap<NodeIndex, HashMap<usize, HashSet<usize>>>,
-    search_space: &mut BTreeSet<NodeIndex>,
+    search_space: &mut BTreeSet<(usize, NodeIndex)>,
     removed_nodes: &mut HashSet<NodeIndex>,
+    next_order: &mut usize,
     multi_centroid: bool,
-) -> Result<()> {
+) -> Result<NodeIndex> {
     let mut members = HashMap::<usize, HashSet<usize>>::new();
     for node in cluster {
         if let Some(mapping) = node_members.remove(node) {
@@ -504,16 +578,19 @@ fn merge_family_cluster(
                 members.entry(member).or_default().extend(centroids);
             }
         }
-        search_space.remove(node);
+        search_space.remove(&logical_node_key(graph, *node));
         removed_nodes.insert(*node);
     }
-    let new_node =
-        crate::merge_nodes::merge_node_cluster(graph, cluster, NodeIndex::new(0), multi_centroid)?;
+    let new_node = merge_node_in_creation_order(graph, cluster, next_order, multi_centroid)?;
     node_members.insert(new_node, members);
-    search_space.insert(new_node);
+    search_space.insert(logical_node_key(graph, new_node));
     // Reused slots must not be processed as the old node in this iteration's snapshot.
     removed_nodes.insert(new_node);
-    Ok(())
+    Ok(new_node)
+}
+
+fn logical_node_key(graph: &Graph<GeneNode, GeneEdge>, node: NodeIndex) -> (usize, NodeIndex) {
+    (graph[node].creation_order, node)
 }
 
 fn split_gene_merge_allowed(
@@ -563,23 +640,22 @@ pub fn collapse_paralogs(
     graph: &mut Graph<GeneNode, GeneEdge>,
     centroid_context: &HashMap<String, Vec<(NodeIndex, usize)>>,
 ) -> Result<()> {
+    let mut next_order = next_creation_order(graph);
     let mut ordered_contexts: Vec<_> = centroid_context.iter().collect();
-    ordered_contexts.sort_by_key(|(centroid, _)| *centroid);
+    ordered_contexts.sort_by_key(|(_, contexts)| {
+        contexts
+            .iter()
+            .map(|&(node, _)| logical_node_key(graph, node))
+            .min()
+    });
     for (_, contexts) in ordered_contexts {
         let mut contexts = contexts.clone();
-        contexts.sort();
+        contexts.sort_unstable_by_key(|&(node, member)| (logical_node_key(graph, node), member));
         let mut member_paralogs = BTreeMap::<usize, Vec<NodeIndex>>::new();
         for &(node, member) in &contexts {
             member_paralogs.entry(member).or_default().push(node);
         }
-        let Some((&reference_member, references)) =
-            member_paralogs.iter().max_by(|first, second| {
-                first
-                    .1
-                    .len()
-                    .cmp(&second.1.len())
-                    .then_with(|| second.0.cmp(first.0))
-            })
+        let Some((reference_member, references)) = paralog_reference(graph, &member_paralogs)
         else {
             continue;
         };
@@ -645,11 +721,27 @@ pub fn collapse_paralogs(
         }
         for cluster in clusters {
             if cluster.len() > 1 {
-                crate::merge_nodes::merge_node_cluster(graph, &cluster, NodeIndex::new(0), true)?;
+                merge_node_in_creation_order(graph, &cluster, &mut next_order, true)?;
             }
         }
     }
     Ok(())
+}
+
+fn paralog_reference<'a>(
+    graph: &Graph<GeneNode, GeneEdge>,
+    paralogs: &'a BTreeMap<usize, Vec<NodeIndex>>,
+) -> Option<(usize, &'a [NodeIndex])> {
+    // Occurrences are sorted by logical node ID, not by isolate.
+    paralogs
+        .iter()
+        .min_by_key(|(_, occurrences)| {
+            (
+                std::cmp::Reverse(occurrences.len()),
+                logical_node_key(graph, occurrences[0]),
+            )
+        })
+        .map(|(&member, occurrences)| (member, occurrences.as_slice()))
 }
 
 fn graph_distances(
@@ -678,8 +770,8 @@ fn graph_distances(
     distances
 }
 
-fn weighted_context(graph: &Graph<GeneNode, GeneEdge>, node: NodeIndex) -> HashMap<String, usize> {
-    let mut context = HashMap::new();
+fn weighted_context(graph: &Graph<GeneNode, GeneEdge>, node: NodeIndex) -> BTreeMap<String, usize> {
+    let mut context = BTreeMap::new();
     for (_, neighbor, depth) in mod_bfs_edges(graph, node, Some(5)) {
         context.insert(graph[neighbor].centroid[0].clone(), depth);
     }
@@ -689,6 +781,21 @@ fn weighted_context(graph: &Graph<GeneNode, GeneEdge>, node: NodeIndex) -> HashM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equal_copy_paralog_reference_uses_first_occurrence_not_isolate_or_slot() {
+        let mut graph = Graph::default();
+        let [a, b, c, d] = [8, 10, 4, 12].map(|creation_order| {
+            graph.add_node(GeneNode {
+                creation_order,
+                ..GeneNode::default()
+            })
+        });
+        let mut paralogs = BTreeMap::from([(0, vec![a, b]), (9, vec![c, d])]);
+        assert_eq!(paralog_reference(&graph, &paralogs), Some((9, &[c, d][..])));
+        paralogs.get_mut(&9).unwrap().pop();
+        assert_eq!(paralog_reference(&graph, &paralogs), Some((0, &[a, b][..])));
+    }
 
     #[test]
     fn frontier_trim_matches_full_scans_for_rounds_and_parallel_edges() {
@@ -715,6 +822,7 @@ mod tests {
                     GeneEdge {
                         size: 1,
                         members: BTreeSet::new(),
+                        ..GeneEdge::default()
                     },
                 );
             }
@@ -767,6 +875,7 @@ mod tests {
                 GeneEdge {
                     size: 1,
                     members: BTreeSet::new(),
+                    ..GeneEdge::default()
                 },
             );
         }
@@ -804,6 +913,7 @@ mod tests {
             GeneEdge {
                 size: 1,
                 members: BTreeSet::new(),
+                ..GeneEdge::default()
             },
         );
 

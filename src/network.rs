@@ -8,6 +8,7 @@ use petgraph::Undirected;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type Graph<N, E> = StableGraph<N, E, Undirected>;
 
@@ -15,6 +16,8 @@ pub type Graph<N, E> = StableGraph<N, E, Undirected>;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GeneNode {
     pub size: usize,
+    #[serde(skip)]
+    pub creation_order: usize,
     pub centroid: Vec<String>,
     pub max_len_id: usize,
     pub members: BTreeSet<usize>,
@@ -34,6 +37,7 @@ impl Default for GeneNode {
     fn default() -> Self {
         Self {
             size: 0,
+            creation_order: 0,
             centroid: Vec::new(),
             max_len_id: 0,
             members: BTreeSet::new(),
@@ -52,10 +56,39 @@ impl Default for GeneNode {
 }
 
 /// Edge data in the pangenome graph
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct GeneEdge {
     pub size: usize,
     pub members: BTreeSet<usize>,
+    #[serde(skip)]
+    pub insertion_order: u64,
+}
+
+pub(crate) fn add_ordered_edge(
+    graph: &mut Graph<GeneNode, GeneEdge>,
+    first: NodeIndex,
+    second: NodeIndex,
+    mut edge: GeneEdge,
+) -> EdgeIndex {
+    // Petgraph can reuse edge slots, so a slot is not an insertion timestamp.
+    static NEXT_EDGE: AtomicU64 = AtomicU64::new(1);
+    edge.insertion_order = NEXT_EDGE.fetch_add(1, Ordering::Relaxed);
+    graph.add_edge(first, second, edge)
+}
+
+pub(crate) fn ordered_edges(
+    graph: &Graph<GeneNode, GeneEdge>,
+    node: NodeIndex,
+    scratch: &mut Vec<(u64, EdgeIndex, NodeIndex)>,
+) {
+    use petgraph::visit::EdgeRef;
+    scratch.clear();
+    scratch.extend(
+        graph
+            .edges(node)
+            .map(|edge| (edge.weight().insertion_order, edge.id(), edge.target())),
+    );
+    scratch.sort_unstable_by_key(|&(order, edge, _)| (order, edge));
 }
 
 #[derive(Debug)]
@@ -256,6 +289,9 @@ fn build_graph(
     let mut edge_index = HashMap::new();
     let mut prev: Option<NodeIndex> = None;
     let mut previous_location: Option<(usize, usize)> = None;
+    // Panaroo keeps the CD-HIT cluster ID for regular nodes and numbers
+    // paralog occurrences after the cluster IDs, in encounter order.
+    let mut next_paralog_id = cluster_centroids.keys().max().map_or(0, |id| id + 2);
 
     for seq_id in seq_ids {
         let current_cluster = match seq_to_cluster.get(seq_id) {
@@ -315,6 +351,8 @@ fn build_graph(
                 )?;
 
                 if paralogs.contains(&current_cluster) {
+                    graph[node_idx].creation_order = next_paralog_id;
+                    next_paralog_id += 1;
                     centroid_context
                         .entry(centroid.clone())
                         .or_insert_with(Vec::new)
@@ -340,6 +378,8 @@ fn build_graph(
                     false,
                 )?;
 
+                graph[node_idx].creation_order = next_paralog_id;
+                next_paralog_id += 1;
                 centroid_context
                     .entry(centroid.clone())
                     .or_insert_with(Vec::new)
@@ -353,6 +393,7 @@ fn build_graph(
                             s.insert(genome_id);
                             s
                         },
+                        ..GeneEdge::default()
                     };
                     add_indexed_edge(&mut graph, &mut edge_index, p, node_idx, edge);
                 }
@@ -380,6 +421,7 @@ fn build_graph(
                                 s.insert(genome_id);
                                 s
                             },
+                            ..GeneEdge::default()
                         };
                         add_indexed_edge(&mut graph, &mut edge_index, p, node_idx, edge);
                     }
@@ -409,6 +451,7 @@ fn build_graph(
                                     s.insert(genome_id);
                                     s
                                 },
+                                ..GeneEdge::default()
                             };
                             add_indexed_edge(&mut graph, &mut edge_index, p, node_idx, edge);
                         }
@@ -444,7 +487,7 @@ fn add_indexed_edge(
     second: NodeIndex,
     edge: GeneEdge,
 ) {
-    let edge = graph.add_edge(first, second, edge);
+    let edge = add_ordered_edge(graph, first, second, edge);
     index.insert((first, second), edge);
 }
 
@@ -467,6 +510,7 @@ fn add_node(
 
     let node = GeneNode {
         size: 1,
+        creation_order: cluster_id,
         centroid: vec![centroid.clone()],
         max_len_id: 0,
         members: {
@@ -535,6 +579,7 @@ mod tests {
                 GeneEdge {
                     size: 1,
                     members: BTreeSet::new(),
+                    ..GeneEdge::default()
                 },
             );
             for x in [a, b, c] {
