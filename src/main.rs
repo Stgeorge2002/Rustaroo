@@ -1,11 +1,13 @@
 //! Main Rustaroo CLI
 //!
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
 use rustaroo::*;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,6 +60,10 @@ struct Args {
     /// Output directory
     #[arg(short = 'o', long)]
     out_dir: PathBuf,
+
+    /// Keep only rustaroo.log, pan_genome_reference.fa, and gene_presence_absence.csv
+    #[arg(long, conflicts_with = "keep_temp")]
+    minimal: bool,
 
     /// Stringency mode (strict/moderate/sensitive)
     #[arg(long = "clean-mode")]
@@ -152,23 +158,79 @@ struct Args {
     keep_temp: bool,
 }
 
+struct RunLog {
+    file: std::fs::File,
+    console: bool,
+    error: Arc<parking_lot::Mutex<Option<io::Error>>>,
+}
+
+impl Write for RunLog {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Err(error) = self.file.write_all(buf) {
+            // env_logger cannot return sink errors to the caller.
+            self.error.lock().get_or_insert(error);
+        }
+        if self.console {
+            io::stderr().write_all(buf)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.threads == 0 {
         anyhow::bail!("--threads must be greater than zero");
     }
 
-    // Initialize logger
-    if args.verbose {
-        env_logger::Builder::from_default_env()
-            .filter_level(log::LevelFilter::Debug)
-            .init();
-    } else if !args.quiet {
-        env_logger::Builder::from_default_env()
-            .filter_level(log::LevelFilter::Info)
-            .init();
+    let log_path = args.out_dir.join("rustaroo.log");
+    let log_error = Arc::new(parking_lot::Mutex::new(None));
+    if args.minimal || args.verbose || !args.quiet {
+        let mut logger = env_logger::Builder::from_default_env();
+        logger.filter_level(if args.verbose {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        });
+        if args.minimal {
+            std::fs::create_dir_all(&args.out_dir)?;
+            logger
+                .write_style(env_logger::WriteStyle::Never)
+                .target(env_logger::Target::Pipe(Box::new(RunLog {
+                    file: std::fs::File::create(&log_path)
+                        .with_context(|| format!("Creating {}", log_path.display()))?,
+                    console: args.verbose || !args.quiet,
+                    error: Arc::clone(&log_error),
+                })));
+        }
+        logger.init();
     }
 
+    let result = run(&args);
+    if args.minimal {
+        if let Err(error) = &result {
+            log::error!("{error:#}");
+        }
+        if let Some(error) = log_error.lock().take() {
+            if let Err(pipeline_error) = &result {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Writing {} after run failed: {pipeline_error:#}",
+                        log_path.display()
+                    )
+                });
+            }
+            return Err(error).with_context(|| format!("Writing {}", log_path.display()));
+        }
+    }
+    result
+}
+
+fn run(args: &Args) -> Result<()> {
     log::info!("Rustaroo v{}", rustaroo::VERSION);
     log::info!("Mode: {:?}", args.mode);
 
@@ -179,8 +241,19 @@ fn main() -> Result<()> {
         }
     }
 
-    // Create output directory
     std::fs::create_dir_all(&args.out_dir)?;
+    let work_dir = if args.minimal {
+        Some(
+            tempfile::Builder::new()
+                .prefix(".rustaroo-")
+                .tempdir_in(&args.out_dir)?,
+        )
+    } else {
+        None
+    };
+    let work_path = work_dir
+        .as_ref()
+        .map_or(args.out_dir.as_path(), |dir| dir.path());
 
     // Convert mode to string for compatibility
     let mode_str = match args.mode {
@@ -214,7 +287,17 @@ fn main() -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
         .build()?;
-    pool.install(|| run_rustaroo_pipeline(&rustaroo_args, &args))?;
+    pool.install(|| run_rustaroo_pipeline(&rustaroo_args, args, work_path))?;
+    if let Some(work_dir) = work_dir {
+        for name in ["pan_genome_reference.fa", "gene_presence_absence.csv"] {
+            let destination = args.out_dir.join(name);
+            std::fs::rename(work_dir.path().join(name), &destination)
+                .with_context(|| format!("Publishing {}", destination.display()))?;
+        }
+        work_dir
+            .close()
+            .context("Removing minimal-mode working files")?;
+    }
 
     log::info!("Rustaroo completed successfully!");
     log::info!("Output written to: {}", args.out_dir.display());
@@ -222,11 +305,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Result<()> {
+fn run_rustaroo_pipeline(
+    rustaroo_args: &args::RustarooArgs,
+    args: &Args,
+    outdir_path: &Path,
+) -> Result<()> {
     let pipeline_started = Instant::now();
     let mut timings = Vec::new();
-    let outdir = args.out_dir.to_string_lossy().to_string();
-    let outdir_path = args.out_dir.as_path();
+    let outdir = outdir_path.to_string_lossy();
 
     // Step 1: Process input GFF files
     log::info!("Step 1: Processing input GFF files...");
@@ -320,7 +406,6 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
 
     // Create combined gene_data.csv
     let mut data_csv = std::io::BufWriter::new(std::fs::File::create(&data_file)?);
-    use std::io::Write;
     writeln!(
         data_csv,
         "gff_file,scaffold_name,clustering_id,annotation_id,prot_sequence,dna_sequence,gene_name,description"
@@ -536,16 +621,16 @@ fn run_rustaroo_pipeline(rustaroo_args: &args::RustarooArgs, args: &Args) -> Res
     )?;
     timings.push(("Reference generation", stage_started.elapsed()));
 
-    // Write GML graph
-    let stage_started = Instant::now();
-    let gml_file = outdir_path.join("final_graph.gml");
-    output::write_gml(&graph, gml_file.to_str().unwrap())?;
-
-    // Write summary statistics
-    output::write_summary_stats(&graph, &outdir, all_genes.len())?;
-    timings.push(("Graph and summary output", stage_started.elapsed()));
-
-    log::info!("Generated presence/absence matrix, reference, and graph files");
+    if args.minimal {
+        log::info!("Generated presence/absence matrix and reference");
+    } else {
+        let stage_started = Instant::now();
+        let gml_file = outdir_path.join("final_graph.gml");
+        output::write_gml(&graph, gml_file.to_str().unwrap())?;
+        output::write_summary_stats(&graph, &outdir, all_genes.len())?;
+        timings.push(("Graph and summary output", stage_started.elapsed()));
+        log::info!("Generated presence/absence matrix, reference, and graph files");
+    }
     log::info!(
         "Output generation completed in {:.3}s",
         output_started.elapsed().as_secs_f64()

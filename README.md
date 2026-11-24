@@ -246,6 +246,15 @@ The main pipeline writes these files; exact format/metadata parity is not guaran
 
 Isolate columns follow input order. Presence/absence sequence identifiers are mapped back to annotation identifiers from `gene_data.csv`.
 
+Use `--minimal` to retain only `rustaroo.log`, `pan_genome_reference.fa`, and
+`gene_presence_absence.csv`. This leaves clustering, refinding, and reference
+selection unchanged. Working files are created in a temporary subdirectory
+of `--out-dir` and removed when the command exits normally. Use a fresh output
+directory if you want only those three files; existing unrelated files are not
+removed. `--quiet` still suppresses console logging, but minimal mode saves a
+log. Core alignments follow the usual `--skip-core-aln` setting and are not
+retained in minimal mode. `--minimal` cannot be combined with `--keep-temp`.
+
 The GML writer includes node labels, centroid sequences, sequence/genome memberships, lengths, and edge genome memberships. Lists use NetworkX's GML encoding (including singleton markers), and strings use GML character entities rather than backslash quote escapes. Remaining graph/output parity limitations are listed below.
 
 ### Rustaroo reference selection
