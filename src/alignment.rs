@@ -203,10 +203,41 @@ impl RefindMatcher {
         Some(self.recover(target, best, first_end, last_end, scratch))
     }
 
+    /// A cheap first distance limit: zero when the query occurs verbatim in
+    /// the target, since that occurrence is a zero-cost global alignment.
+    fn first_limit(&self, target: &[u8]) -> Option<usize> {
+        // Only worth it when the limit can prune whole 64-row blocks.
+        if self.length <= 64 {
+            return None;
+        }
+        memchr::memmem::find(target, &self.query).map(|_| 0)
+    }
+
     fn single_pass_endpoints(
         &self,
         target: &[u8],
         scratch: &mut RefindScratch,
+    ) -> Option<(usize, usize, usize)> {
+        // Every cell of the last row is at most the query length, so an
+        // unlimited scan always finds an endpoint for a nonempty target. A
+        // scan limited to `limit` is exact whenever it finds an endpoint: the
+        // block cut-off only discards cells whose distance exceeds the bound,
+        // and the bound never drops below the optimum. If the limited scan
+        // finds nothing, the optimum exceeds `limit` and the full scan runs
+        // (the verbatim-occurrence limit of zero always succeeds).
+        if let Some(limit) = self.first_limit(target) {
+            if let Some(found) = self.single_pass_endpoints_within(target, scratch, limit) {
+                return Some(found);
+            }
+        }
+        self.single_pass_endpoints_within(target, scratch, self.length)
+    }
+
+    fn single_pass_endpoints_within(
+        &self,
+        target: &[u8],
+        scratch: &mut RefindScratch,
+        limit: usize,
     ) -> Option<(usize, usize, usize)> {
         let pattern = self
             .forward
@@ -215,7 +246,7 @@ impl RefindMatcher {
         let states = &mut scratch.states;
         let blocks = states.len();
         let mut active = blocks;
-        let mut bound = self.length;
+        let mut bound = limit.min(self.length);
         let mut first = 0;
         let mut last = 0;
         for (index, &base) in target.iter().enumerate() {
@@ -264,7 +295,20 @@ impl RefindMatcher {
                 }
             }
             // Only drop trailing blocks with no row at or below the bound.
-            while active > 1 && states[active - 1].distance >= bound + 64 {
+            // Within a block, going up from its last row each row can only be
+            // smaller than the one below by one where that row's vertical
+            // delta is positive, so the block minimum is at least its last-row
+            // distance minus the number of positive deltas (which is never
+            // weaker than the 63-row bound `distance >= bound + 64`).
+            while active > 1 && {
+                let state = &states[active - 1];
+                let used = (pattern.boundaries[active - 1] << 1).wrapping_sub(1);
+                state.distance >= bound + 64
+                    || state
+                        .distance
+                        .saturating_sub((state.positive & used).count_ones() as usize)
+                        > bound
+            } {
                 active -= 1;
             }
         }
@@ -638,6 +682,87 @@ mod tests {
                 alphabet[*state as usize % alphabet.len()]
             })
             .collect()
+    }
+
+    #[test]
+    fn limited_single_pass_is_exact_or_reports_nothing() {
+        // The limited scan must return exactly the unlimited endpoints whenever
+        // the optimum is within the limit, and nothing otherwise.
+        let mut seed = 0x51ed_2701_9c3b_77a1u64;
+        let mut scratch = RefindScratch::default();
+        for case in 0..900 {
+            let length = [
+                1, 5, 40, 63, 64, 65, 100, 127, 128, 129, 200, 300, 520, 1100,
+            ][case % 14];
+            let alphabet: &[u8] = if case % 3 == 0 { b"ACGTNEX" } else { b"ACGT" };
+            let query = random_sequence(length, alphabet, &mut seed);
+            let mut target = random_sequence(length * 4 + 31, alphabet, &mut seed);
+            // Plant a mutated copy of the query (substitutions and indels).
+            if case % 5 != 0 {
+                let mut copy = query.clone();
+                let rate = [0usize, 50, 20, 9, 4][case % 5];
+                if rate > 0 {
+                    let mut index = (seed as usize) % rate.max(1);
+                    while index < copy.len() {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        match seed % 3 {
+                            0 => copy[index] = b"ACGT"[(seed >> 8) as usize % 4],
+                            1 => {
+                                copy.insert(index, b"ACGT"[(seed >> 8) as usize % 4]);
+                            }
+                            _ => {
+                                copy.remove(index);
+                            }
+                        }
+                        index += 1 + (seed >> 16) as usize % rate;
+                    }
+                }
+                let at = (seed as usize) % (target.len() - copy.len().min(target.len()) + 1);
+                let end = (at + copy.len()).min(target.len());
+                target.splice(at..end, copy.iter().copied());
+                if case % 7 == 0 {
+                    // A second, identical copy creates endpoint ties.
+                    target.extend(&copy);
+                }
+            }
+            if case % 4 == 0 {
+                let padding = length / 2;
+                target = [vec![b'E'; padding], target, vec![b'E'; padding]].concat();
+            }
+            let matcher = RefindMatcher::new(&query).unwrap();
+            let full = matcher
+                .single_pass_endpoints_within(&target, &mut scratch, length)
+                .unwrap();
+            let mut expected = (usize::MAX, 0, 0);
+            for (end, distance) in matcher.matcher.find_all_end(&target, length) {
+                if distance < expected.0 {
+                    expected = (distance, end + 1, end + 1);
+                } else if distance == expected.0 {
+                    expected.2 = end + 1;
+                }
+            }
+            assert_eq!(full, expected, "case {case}");
+            assert_eq!(
+                matcher.single_pass_endpoints(&target, &mut scratch),
+                Some(full)
+            );
+            let limits = [0, 1, 2, 3, 8, 16, 33, 63, 64, 65, 100, 130, 200, 400];
+            for limit in limits.into_iter().chain([
+                full.0.saturating_sub(1),
+                full.0,
+                full.0 + 1,
+                length / 8 + 8,
+            ]) {
+                let limited = matcher.single_pass_endpoints_within(&target, &mut scratch, limit);
+                if full.0 <= limit {
+                    assert_eq!(limited, Some(full), "case {case} limit {limit}");
+                } else {
+                    assert_eq!(limited, None, "case {case} limit {limit}");
+                }
+            }
+        }
     }
 
     #[test]

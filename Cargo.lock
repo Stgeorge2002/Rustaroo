@@ -1052,6 +1052,7 @@ dependencies = [
  "indicatif",
  "itertools 0.11.0",
  "log",
+ "memchr",
  "nalgebra 0.31.4",
  "ndarray",
  "once_cell",
