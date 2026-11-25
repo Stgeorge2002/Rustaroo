@@ -51,3 +51,8 @@ rand = "0.8"
 
 # External tool integration
 which = "4.4"
+
+[profile.release]
+# Whole-program optimisation; does not change floating-point semantics or output.
+lto = "fat"
+codegen-units = 1
