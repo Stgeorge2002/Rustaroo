@@ -322,21 +322,17 @@ fn run_rustaroo_pipeline(
         .par_iter()
         .enumerate()
         .map(|(i, input_file)| {
-            let (genes, proteins) = prokka::get_gene_sequences(
-                input_file,
-                i,
-                args.remove_invalid_genes,
-                args.codon_table,
-            )?;
+            let proteins =
+                prokka::get_gene_list(input_file, i, args.remove_invalid_genes, args.codon_table)?;
 
             // Write intermediate output files
             let prot_file = outdir_path.join(format!("input_{}.prot.fa", i));
             let dna_file = outdir_path.join(format!("input_{}.dna.fa", i));
             let csv_file = outdir_path.join(format!("input_{}.csv", i));
 
-            if !genes.is_empty() {
+            if !proteins.is_empty() {
                 prokka::output_files(
-                    &genes,
+                    &std::collections::HashMap::new(),
                     &proteins,
                     prot_file.to_str().unwrap(),
                     dna_file.to_str().unwrap(),
@@ -346,7 +342,7 @@ fn run_rustaroo_pipeline(
             } else {
                 anyhow::bail!("No valid coding sequences in {}", input_file);
             }
-            Ok(genes.len())
+            Ok(proteins.len())
         })
         .collect::<Result<_>>()?;
     timings.push(("GFF processing", stage_started.elapsed()));

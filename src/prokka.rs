@@ -23,6 +23,73 @@ pub struct GeneRecord {
 
 /// Translate DNA to protein using bacterial codon table
 pub fn translate(dna: &str, table: usize) -> String {
+    // ASCII input (all real DNA) takes a byte-level path with exactly the same
+    // result; anything else uses the original Unicode-aware implementation.
+    if !dna.is_ascii() {
+        return translate_str(dna, table);
+    }
+    let dna = dna.as_bytes();
+    let mut protein = Vec::with_capacity(dna.len() / 3);
+    for codon in dna.chunks_exact(3) {
+        protein.push(codon_amino([
+            codon[0].to_ascii_uppercase(),
+            codon[1].to_ascii_uppercase(),
+            codon[2].to_ascii_uppercase(),
+        ]));
+    }
+    if table == 11
+        && dna.len() >= 3
+        && matches!(
+            [
+                dna[0].to_ascii_uppercase(),
+                dna[1].to_ascii_uppercase(),
+                dna[2].to_ascii_uppercase(),
+            ],
+            [b'T', b'T', b'G']
+                | [b'C', b'T', b'G']
+                | [b'A', b'T', b'T']
+                | [b'A', b'T', b'C']
+                | [b'A', b'T', b'A']
+                | [b'A', b'T', b'G']
+                | [b'G', b'T', b'G']
+        )
+        && !protein.is_empty()
+    {
+        protein[0] = b'M';
+    }
+    String::from_utf8(protein).expect("translation is ASCII")
+}
+
+#[inline]
+fn codon_amino(codon: [u8; 3]) -> u8 {
+    match &codon {
+        b"TTT" | b"TTC" => b'F',
+        b"TTA" | b"TTG" | b"CTT" | b"CTC" | b"CTA" | b"CTG" => b'L',
+        b"ATT" | b"ATC" | b"ATA" => b'I',
+        b"ATG" => b'M',
+        b"GTT" | b"GTC" | b"GTA" | b"GTG" => b'V',
+        b"TCT" | b"TCC" | b"TCA" | b"TCG" | b"AGT" | b"AGC" => b'S',
+        b"CCT" | b"CCC" | b"CCA" | b"CCG" => b'P',
+        b"ACT" | b"ACC" | b"ACA" | b"ACG" => b'T',
+        b"GCT" | b"GCC" | b"GCA" | b"GCG" => b'A',
+        b"TAT" | b"TAC" => b'Y',
+        b"TAA" | b"TAG" | b"TGA" => b'*',
+        b"CAT" | b"CAC" => b'H',
+        b"CAA" | b"CAG" => b'Q',
+        b"AAT" | b"AAC" => b'N',
+        b"AAA" | b"AAG" => b'K',
+        b"GAT" | b"GAC" => b'D',
+        b"GAA" | b"GAG" => b'E',
+        b"TGT" | b"TGC" => b'C',
+        b"TGG" => b'W',
+        b"CGT" | b"CGC" | b"CGA" | b"CGG" | b"AGA" | b"AGG" => b'R',
+        b"GGT" | b"GGC" | b"GGA" | b"GGG" => b'G',
+        _ => b'X', // Unknown codon
+    }
+}
+
+/// Reference translation for any (including non-ASCII) input.
+fn translate_str(dna: &str, table: usize) -> String {
     let dna_upper = dna.to_uppercase();
     let mut protein = String::new();
 
@@ -75,6 +142,29 @@ pub fn translate(dna: &str, table: usize) -> String {
 
 /// Reverse complement a DNA sequence
 pub fn reverse_complement(dna: &str) -> String {
+    if !dna.is_ascii() {
+        return reverse_complement_chars(dna);
+    }
+    // Byte-level fast path; identical to the char-level version for ASCII.
+    let bytes: Vec<u8> = dna
+        .bytes()
+        .rev()
+        .map(|c| match c {
+            b'A' => b'T',
+            b'T' => b'A',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'a' => b't',
+            b't' => b'a',
+            b'c' => b'g',
+            b'g' => b'c',
+            _ => c,
+        })
+        .collect();
+    String::from_utf8(bytes).expect("reverse complement of ASCII is ASCII")
+}
+
+fn reverse_complement_chars(dna: &str) -> String {
     dna.chars()
         .rev()
         .map(|c| match c {
@@ -98,6 +188,22 @@ pub fn get_gene_sequences(
     filter_seqs: bool,
     table: usize,
 ) -> Result<(HashMap<String, GeneRecord>, Vec<GeneRecord>)> {
+    let protein_list = get_gene_list(gff_file_name, file_number, filter_seqs, table)?;
+    let sequence_dictionary = protein_list
+        .iter()
+        .map(|record| (record.id.clone(), record.clone()))
+        .collect();
+    Ok((sequence_dictionary, protein_list))
+}
+
+/// Parse GFF3 and extract gene records in clustering-id order, without the
+/// per-id dictionary built by [`get_gene_sequences`].
+pub fn get_gene_list(
+    gff_file_name: &str,
+    file_number: usize,
+    filter_seqs: bool,
+    table: usize,
+) -> Result<Vec<GeneRecord>> {
     let content = std::fs::read_to_string(gff_file_name)
         .with_context(|| format!("Failed to read GFF file: {}", gff_file_name))?;
 
@@ -123,7 +229,10 @@ pub fn get_gene_sequences(
         }
         if line.starts_with('>') {
             if !current_id.is_empty() {
-                sequences.insert(current_id.clone(), current_seq.clone());
+                sequences.insert(
+                    std::mem::take(&mut current_id),
+                    std::mem::take(&mut current_seq),
+                );
             }
             current_id = line[1..]
                 .split_whitespace()
@@ -258,8 +367,8 @@ pub fn get_gene_sequences(
             .push((start, record));
     }
 
-    // Sort genes by position and assign clustering IDs
-    let mut sequence_dictionary = HashMap::new();
+    // Sort genes by position and assign clustering IDs. Ids are unique
+    // (file, scaffold, index), so the list has one record per id.
     let mut protein_list = Vec::new();
 
     let mut scaff_count = 0;
@@ -267,23 +376,18 @@ pub fn get_gene_sequences(
         let mut genes = scaffold_genes.remove(&scaffold).unwrap();
         genes.sort_by_key(|(start, _)| *start);
 
-        for (gene_index, (_start, gene)) in genes.into_iter().enumerate() {
-            let clustering_id = format!("{}_{}_{}", file_number, scaff_count, gene_index);
-
-            let mut record = gene.clone();
-            record.id = clustering_id.clone();
-
-            sequence_dictionary.insert(clustering_id, record.clone());
+        for (gene_index, (_start, mut record)) in genes.into_iter().enumerate() {
+            record.id = format!("{}_{}_{}", file_number, scaff_count, gene_index);
             protein_list.push(record);
         }
         scaff_count += 1;
     }
 
-    if sequence_dictionary.is_empty() {
+    if protein_list.is_empty() {
         anyhow::bail!("No valid sequences found in GFF");
     }
 
-    Ok((sequence_dictionary, protein_list))
+    Ok(protein_list)
 }
 
 /// Write sequences to FASTA files and CSV
@@ -374,6 +478,32 @@ mod tests {
     fn test_translate() {
         assert_eq!(translate("ATGGCCTAG", 11), "MA*");
         assert_eq!(translate("ATGAAATAG", 11), "MK*");
+    }
+
+    #[test]
+    fn byte_paths_match_reference_implementations() {
+        let alphabet = b"ACGTacgtNnRYXE*-";
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for length in 0..200 {
+            for _ in 0..20 {
+                let dna: String = (0..length)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        alphabet[state as usize % alphabet.len()] as char
+                    })
+                    .collect();
+                for table in [1, 4, 11] {
+                    assert_eq!(translate(&dna, table), translate_str(&dna, table), "{dna}");
+                }
+                assert_eq!(reverse_complement(&dna), reverse_complement_chars(&dna));
+            }
+        }
+        for dna in ["ATGß", "ÄTGAAA", "ttgaaataa", "ctg", "GTGAAATAG"] {
+            assert_eq!(translate(dna, 11), translate_str(dna, 11));
+            assert_eq!(reverse_complement(dna), reverse_complement_chars(dna));
+        }
     }
 
     #[test]

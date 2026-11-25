@@ -455,7 +455,10 @@ fn search_gff_file(
         }
         if line.starts_with('>') {
             if !current_id.is_empty() {
-                contigs.insert(current_id.clone(), current_seq.clone());
+                contigs.insert(
+                    std::mem::take(&mut current_id),
+                    std::mem::take(&mut current_seq),
+                );
             }
             current_id = line[1..]
                 .split_whitespace()
