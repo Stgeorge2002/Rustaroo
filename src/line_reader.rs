@@ -18,6 +18,19 @@ impl LineReader {
         })
     }
 
+    /// Open `path` positioned at byte `offset`.
+    pub fn open_at(path: &str, offset: u64) -> std::io::Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = File::open(path)?;
+        if offset != 0 {
+            file.seek(SeekFrom::Start(offset))?;
+        }
+        Ok(Self {
+            reader: BufReader::with_capacity(1 << 20, file),
+            buffer: Vec::new(),
+        })
+    }
+
     pub fn next_line(&mut self) -> Option<std::io::Result<&str>> {
         self.buffer.clear();
         match self.reader.read_until(b'\n', &mut self.buffer) {

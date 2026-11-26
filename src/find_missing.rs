@@ -40,14 +40,51 @@ pub fn find_missing(
     prot_seq_file: &str,
     options: &RefindOptions,
 ) -> Result<()> {
+    find_missing_with_ids(
+        graph,
+        gff_files,
+        gene_data_file,
+        dna_seq_file,
+        prot_seq_file,
+        options,
+        None,
+    )
+    .map(|_| ())
+}
+
+/// `find_missing`, optionally given the result of
+/// `load_annotation_ids(gene_data_file)` computed earlier on the same file
+/// contents (it is consumed exactly where it would have been loaded).
+/// Returns the annotation map so later stages can extend it.
+pub fn find_missing_with_ids(
+    graph: &mut Graph<GeneNode, GeneEdge>,
+    gff_files: &[String],
+    gene_data_file: &str,
+    dna_seq_file: &str,
+    prot_seq_file: &str,
+    options: &RefindOptions,
+    annotation_ids: Option<Result<AnnotationIds>>,
+) -> Result<AnnotationIds> {
     let stage_started = Instant::now();
     if options.verbose {
         println!("Finding missing genes...");
     }
 
-    let id_to_gff = load_annotation_ids(gene_data_file)?;
-    let search_list = build_search_list(graph, &id_to_gff)?;
-    let merged_sequences = load_merged_sequences(graph, gene_data_file)?;
+    let id_to_gff = match annotation_ids {
+        Some(ids) => ids?,
+        None => load_annotation_ids(gene_data_file)?,
+    };
+    // Independent reads of the graph (and of the metadata file); errors are
+    // reported in the original order.
+    let (search_list, merged_sequences) = {
+        let graph = &*graph;
+        rayon::join(
+            || build_search_list(graph, &id_to_gff),
+            || load_merged_sequences(graph, gene_data_file),
+        )
+    };
+    let search_list = search_list?;
+    let merged_sequences = merged_sequences?;
     let preparation_elapsed = stage_started.elapsed();
 
     let n_searches: usize = search_list.values().map(|v| v.searches.len()).sum();
@@ -108,7 +145,6 @@ pub fn find_missing(
     );
     progress.finish_with_message("searches complete");
     drop(search_list);
-    drop(id_to_gff);
     drop(merged_sequences);
 
     let stage_started = Instant::now();
@@ -217,7 +253,7 @@ pub fn find_missing(
         update_elapsed.as_secs_f64()
     );
 
-    Ok(())
+    Ok(id_to_gff)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -911,10 +947,23 @@ pub type AnnotationIds = crate::reference::fxhash::HashMap<String, String>;
 
 /// Map clustering identifiers to original annotation identifiers.
 pub fn load_annotation_ids(gene_data_file: &str) -> Result<AnnotationIds> {
-    let mut lines = LineReader::open(gene_data_file)?;
-    let mut id_to_gff = AnnotationIds::default();
+    load_annotation_ids_from(gene_data_file, AnnotationIds::default(), 0, 0).map(|(ids, _)| ids)
+}
 
-    let mut i = 0usize;
+/// Continue `load_annotation_ids` on the part of `gene_data_file` starting
+/// at byte `offset`, which must be the start of line number `first_line`
+/// (zero-based), with `id_to_gff` holding the result for the lines before.
+/// The result is exactly that of `load_annotation_ids` on the whole file.
+/// Also returns the total number of lines read.
+pub fn load_annotation_ids_from(
+    gene_data_file: &str,
+    mut id_to_gff: AnnotationIds,
+    offset: u64,
+    first_line: usize,
+) -> Result<(AnnotationIds, usize)> {
+    let mut lines = LineReader::open_at(gene_data_file, offset)?;
+
+    let mut i = first_line;
     while let Some(line) = lines.next_line() {
         if i == 0 {
             // Like the original `enumerate` loop, the header is skipped
@@ -944,7 +993,7 @@ pub fn load_annotation_ids(gene_data_file: &str) -> Result<AnnotationIds> {
         i += 1;
     }
 
-    Ok(id_to_gff)
+    Ok((id_to_gff, i))
 }
 
 fn build_search_list<'a, S: BuildHasher>(
@@ -1276,6 +1325,38 @@ mod tests {
             .all(|matcher| Arc::ptr_eq(&matchers[0], matcher)));
         assert_eq!(cache.matchers.len(), 1);
         assert!(cache.get("").is_none());
+    }
+
+    #[test]
+    fn annotation_ids_extend_like_a_full_load() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("gene_data.csv");
+        let initial = "header\na,s,0_0_0,ann0,P,D,g,d\na,s,0_0_1,ann1,P,D,g,d\n";
+        let appended = "a,s,0_refound_0,ref0,P,D,g,d\na,s,0_0_1,ann1b,P,D,g,d\n";
+        std::fs::write(&path, initial)?;
+        let path_str = path.to_str().unwrap();
+        let (early, lines) = load_annotation_ids_from(path_str, AnnotationIds::default(), 0, 0)?;
+        assert_eq!(lines, 3);
+        assert_eq!(early, load_annotation_ids(path_str)?);
+        std::fs::write(&path, format!("{initial}{appended}"))?;
+        let (extended, lines) =
+            load_annotation_ids_from(path_str, early, initial.len() as u64, 3)?;
+        assert_eq!(lines, 5);
+        assert_eq!(extended, load_annotation_ids(path_str)?);
+        assert_eq!(extended["0_0_1"], "ann1b");
+        // Errors carry the same line numbers as a full load.
+        std::fs::write(&path, format!("{initial}a,s,,x\n"))?;
+        let full = load_annotation_ids(path_str).unwrap_err().to_string();
+        let partial = load_annotation_ids_from(
+            path_str,
+            AnnotationIds::default(),
+            initial.len() as u64,
+            3,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(partial, full);
+        Ok(())
     }
 
     #[test]

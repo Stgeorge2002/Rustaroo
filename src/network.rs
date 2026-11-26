@@ -110,17 +110,35 @@ struct ClusterData {
     description: String,
 }
 
+/// Network-building results: graph, paralog centroid contexts, and
+/// sequence ID -> centroid.
+pub type NetworkParts = (
+    Graph<GeneNode, GeneEdge>,
+    HashMap<String, Vec<(NodeIndex, usize)>>,
+    HashMap<String, String>,
+);
+
 /// Generate pangenome network from CD-HIT output
 pub fn generate_network(
     cluster_file: &str,
     data_file: &str,
     prot_seq_file: &str,
     all_dna: bool,
-) -> Result<(
-    Graph<GeneNode, GeneEdge>,
-    HashMap<String, Vec<(NodeIndex, usize)>>,
-    HashMap<String, String>,
-)> {
+) -> Result<NetworkParts> {
+    generate_network_with_ids(cluster_file, data_file, all_dna, || {
+        load_sequence_ids(prot_seq_file)
+    })
+}
+
+/// `generate_network`, with the protein-file sequence IDs supplied by the
+/// caller (evaluated where `load_sequence_ids` would have run, so errors
+/// are reported in the same order).
+pub fn generate_network_with_ids(
+    cluster_file: &str,
+    data_file: &str,
+    all_dna: bool,
+    seq_ids: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<NetworkParts> {
     // Parse cluster file
     let (seq_to_cluster, cluster_centroids, cluster_members) = parse_cluster_file(cluster_file)?;
 
@@ -141,7 +159,7 @@ pub fn generate_network(
     let cluster_data = load_cluster_data(data_file, &cluster_centroids, &seq_to_cluster)?;
 
     // Load sequence IDs from protein file
-    let seq_ids = load_sequence_ids(prot_seq_file)?;
+    let seq_ids = seq_ids()?;
 
     // Build graph
     let (graph, centroid_context, seqid_to_centroid) = build_graph(
@@ -270,7 +288,7 @@ fn load_cluster_data(
 }
 
 /// Load sequence IDs from FASTA
-fn load_sequence_ids(fasta_file: &str) -> Result<Vec<String>> {
+pub fn load_sequence_ids(fasta_file: &str) -> Result<Vec<String>> {
     let file = File::open(fasta_file)?;
     let reader = BufReader::new(file);
     let mut seq_ids = Vec::new();

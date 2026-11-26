@@ -374,17 +374,30 @@ fn run_rustaroo_pipeline(
     drop(combined_dna_file);
 
     let output_file = outdir_path.join("cd-hit_output.fasta");
+    let data_file = outdir_path.join("gene_data.csv");
 
-    // Run CD-HIT
+    // Run CD-HIT. Work that neither feeds cd-hit nor depends on its result
+    // runs alongside it: assembling gene_data.csv (only read after
+    // clustering), reading the protein-file sequence IDs, and loading the
+    // annotation-ID map from the new gene_data.csv. Their results, including
+    // any error, are consumed exactly where the original computed them.
     let stage_started = Instant::now();
-    cdhit::run_cdhit(
-        combined_prot.to_str().unwrap(),
-        output_file.to_str().unwrap(),
-        rustaroo_args.id.unwrap_or(0.98),
-        rustaroo_args.len_dif_percent.unwrap_or(0.98),
-        args.threads,
-        &outdir,
-    )?;
+    let (cdhit_result, early) = std::thread::scope(|scope| {
+        let early = scope.spawn(|| {
+            prepare_alongside_clustering(outdir_path, &data_file, all_genes.len(), &combined_prot)
+        });
+        let result = cdhit::run_cdhit(
+            combined_prot.to_str().unwrap(),
+            output_file.to_str().unwrap(),
+            rustaroo_args.id.unwrap_or(0.98),
+            rustaroo_args.len_dif_percent.unwrap_or(0.98),
+            args.threads,
+            &outdir,
+        );
+        (result, early.join())
+    });
+    let early = early.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    cdhit_result?;
     log::info!(
         "Initial clustering completed in {:.3}s",
         stage_started.elapsed().as_secs_f64()
@@ -398,30 +411,25 @@ fn run_rustaroo_pipeline(
     log::info!("Step 3: Generating pangenome network...");
     let stage_started = Instant::now();
     let cluster_file = outdir_path.join("cd-hit_output.fasta.clstr");
-    let data_file = outdir_path.join("gene_data.csv");
 
-    // Create combined gene_data.csv
-    let mut data_csv = std::io::BufWriter::new(std::fs::File::create(&data_file)?);
-    writeln!(
-        data_csv,
-        "gff_file,scaffold_name,clustering_id,annotation_id,prot_sequence,dna_sequence,gene_name,description"
-    )?;
-    for i in 0..all_genes.len() {
-        let csv_file = outdir_path.join(format!("input_{}.csv", i));
-        if csv_file.exists() {
-            let content = std::fs::read_to_string(&csv_file)?;
-            write_csv_body(&mut data_csv, &content)?;
-        }
-    }
-    data_csv.flush()?;
-    drop(data_csv);
+    // gene_data.csv was assembled alongside clustering; its errors surface here,
+    // where the assembly used to run.
+    let EarlyData {
+        gene_data_len,
+        seq_ids,
+        annotation_ids,
+    } = early?;
+    let (annotation_lines, mut annotation_ids) = match annotation_ids {
+        Ok((ids, lines)) => (lines, Some(Ok(ids))),
+        Err(error) => (0, Some(Err(error))),
+    };
 
     let prot_seq_file = combined_prot.to_str().unwrap();
-    let (mut graph, centroid_context, seqid_to_centroid) = network::generate_network(
+    let (mut graph, centroid_context, seqid_to_centroid) = network::generate_network_with_ids(
         cluster_file.to_str().unwrap(),
         data_file.to_str().unwrap(),
-        prot_seq_file,
         false,
+        || seq_ids,
     )?;
 
     log::info!(
@@ -508,12 +516,13 @@ fn run_rustaroo_pipeline(
     );
 
     // Step 5: Find missing genes
+    let mut refind_ids = None;
     if args.refind_mode != RefindMode::Off {
         log::info!("Step 5: Finding missing genes...");
         let refind_started = Instant::now();
         let stage_started = Instant::now();
         let dna_file = outdir_path.join("combined_DNA_CDS.fasta");
-        find_missing::find_missing(
+        let ids = find_missing::find_missing_with_ids(
             &mut graph,
             &rustaroo_args.input_files,
             data_file.to_str().unwrap(),
@@ -529,7 +538,11 @@ fn run_rustaroo_pipeline(
                 creation_order_ties: args.refind_creation_order,
                 verbose: !args.quiet,
             },
+            annotation_ids.take(),
         )?;
+        // Refinding appended to gene_data.csv; the presence/absence map is
+        // this map extended with the appended lines (see below).
+        refind_ids = Some(ids);
         timings.push(("Missing-gene refinding", stage_started.elapsed()));
         let stage_started = Instant::now();
         clean_network::collapse_families_indexed(
@@ -590,7 +603,22 @@ fn run_rustaroo_pipeline(
         mems_to_isolates.insert(i, name);
     }
 
-    let orig_ids = find_missing::load_annotation_ids(data_file.to_str().unwrap())?;
+    // Same as load_annotation_ids on the final gene_data.csv: the map of its
+    // initial contents, extended with any lines refinding appended.
+    let orig_ids = match refind_ids {
+        Some(ids) => {
+            find_missing::load_annotation_ids_from(
+                data_file.to_str().unwrap(),
+                ids,
+                gene_data_len,
+                annotation_lines,
+            )?
+            .0
+        }
+        None => annotation_ids
+            .take()
+            .expect("annotation IDs are consumed only by refinding")?,
+    };
 
     // Generate presence/absence matrix
     let family_names = output::generate_roary_gene_presence_absence(
@@ -642,6 +670,57 @@ fn run_rustaroo_pipeline(
     log::info!("Pipeline total: {:.3}s", total.as_secs_f64());
 
     Ok(())
+}
+
+/// Results of the work run alongside the initial cd-hit clustering.
+struct EarlyData {
+    /// Length of gene_data.csv as first written (before refinding appends).
+    gene_data_len: u64,
+    seq_ids: Result<Vec<String>>,
+    /// `load_annotation_ids` of the initial gene_data.csv, with its line count.
+    annotation_ids: Result<(find_missing::AnnotationIds, usize)>,
+}
+
+/// Assemble gene_data.csv (as the network step used to), then read what the
+/// later steps would read from it and from the protein file. Errors from
+/// the assembly are returned; errors from the reads are kept for the steps
+/// that would have hit them.
+fn prepare_alongside_clustering(
+    outdir_path: &Path,
+    data_file: &Path,
+    genome_count: usize,
+    combined_prot: &Path,
+) -> Result<EarlyData> {
+    let mut data_csv = std::io::BufWriter::new(std::fs::File::create(data_file)?);
+    writeln!(
+        data_csv,
+        "gff_file,scaffold_name,clustering_id,annotation_id,prot_sequence,dna_sequence,gene_name,description"
+    )?;
+    for i in 0..genome_count {
+        let csv_file = outdir_path.join(format!("input_{}.csv", i));
+        if csv_file.exists() {
+            let content = std::fs::read_to_string(&csv_file)?;
+            write_csv_body(&mut data_csv, &content)?;
+        }
+    }
+    data_csv.flush()?;
+    let gene_data_len = data_csv
+        .into_inner()
+        .map_err(|error| error.into_error())?
+        .metadata()?
+        .len();
+    let seq_ids = network::load_sequence_ids(combined_prot.to_str().unwrap());
+    let annotation_ids = find_missing::load_annotation_ids_from(
+        data_file.to_str().unwrap(),
+        Default::default(),
+        0,
+        0,
+    );
+    Ok(EarlyData {
+        gene_data_len,
+        seq_ids,
+        annotation_ids,
+    })
 }
 
 /// Write every line of `content` after the header, each followed by `\n`,
