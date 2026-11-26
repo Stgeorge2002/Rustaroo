@@ -39,6 +39,8 @@ struct GlobalPattern {
     slots: [u16; 256],
     masks: Vec<u64>,
     boundaries: Vec<u64>,
+    /// Bit index of each block's boundary row (63 for every full block).
+    shifts: Vec<u32>,
     length: usize,
 }
 
@@ -74,13 +76,15 @@ impl GlobalPattern {
                 masks[slot * block_count + i / 64] |= bit;
             }
         }
-        let boundaries = (0..block_count)
+        let boundaries: Vec<u64> = (0..block_count)
             .map(|block| 1u64 << ((length - block * 64).min(64) - 1))
             .collect();
+        let shifts = boundaries.iter().map(|boundary| boundary.trailing_zeros()).collect();
         Self {
             slots,
             masks,
             boundaries,
+            shifts,
             length,
         }
     }
@@ -99,17 +103,69 @@ impl GlobalPattern {
     fn advance(&self, states: &mut [GlobalState], base: u8) -> usize {
         // A global alignment charges for every target prefix: the top row
         // increases by one, unlike the free-prefix HW endpoint search.
-        let mut carry = 1i8;
         let block_count = self.boundaries.len();
         let start = usize::from(self.slots[usize::from(base)]) * block_count;
         let masks = &self.masks[start..start + block_count];
-        for ((&equal, &boundary), state) in
-            masks.iter().zip(&self.boundaries).zip(states.iter_mut())
-        {
-            carry = advance_refind_block(state, equal, boundary, carry);
+        let (mut positive_carry, mut negative_carry) = (1, 0);
+        for ((&equal, &shift), state) in masks.iter().zip(&self.shifts).zip(states.iter_mut()) {
+            (positive_carry, negative_carry) =
+                advance_block_bits(state, equal, shift, positive_carry, negative_carry);
         }
         states.last().expect("nonempty query").distance
     }
+
+    /// `advance` restricted to blocks `low..high`, with the top boundary of
+    /// block `low` increasing by one per column; returns the distance of the
+    /// last processed block.
+    fn advance_range(&self, states: &mut [GlobalState], base: u8, low: usize, high: usize) -> usize {
+        let block_count = self.boundaries.len();
+        let start = usize::from(self.slots[usize::from(base)]) * block_count;
+        let masks = &self.masks[start + low..start + high];
+        let (mut positive_carry, mut negative_carry) = (1, 0);
+        for ((&equal, &shift), state) in masks
+            .iter()
+            .zip(&self.shifts[low..high])
+            .zip(states[low..high].iter_mut())
+        {
+            (positive_carry, negative_carry) =
+                advance_block_bits(state, equal, shift, positive_carry, negative_carry);
+        }
+        states[high - 1].distance
+    }
+}
+
+/// The same block step as `advance_refind_block`, with the incoming and
+/// outgoing horizontal delta carried as two 0/1 words (positive, negative)
+/// and the boundary row given as a bit index. Feeding the bits straight into
+/// the shifts and masks avoids the sign tests and conversions of the `i8`
+/// carry on the hot path; the arithmetic, and so every result, is identical.
+#[inline(always)]
+fn advance_block_bits(
+    state: &mut GlobalState,
+    equal: u64,
+    shift: u32,
+    positive_carry: u64,
+    negative_carry: u64,
+) -> (u64, u64) {
+    let vertical = equal | state.negative;
+    let equal = equal | negative_carry;
+    let horizontal =
+        ((equal & state.positive).wrapping_add(state.positive) ^ state.positive) | equal;
+    let positive = state.negative | !(horizontal | state.positive);
+    let negative = state.positive & horizontal;
+    // At most one of the two boundary bits is set (positive and negative
+    // horizontal deltas are disjoint).
+    let positive_out = (positive >> shift) & 1;
+    let negative_out = (negative >> shift) & 1;
+    state.distance = state
+        .distance
+        .wrapping_add(positive_out as usize)
+        .wrapping_sub(negative_out as usize);
+    let positive = (positive << 1) | positive_carry;
+    let negative = (negative << 1) | negative_carry;
+    state.positive = negative | !(vertical | positive);
+    state.negative = positive & vertical;
+    (positive_out, negative_out)
 }
 
 #[inline]
@@ -253,14 +309,16 @@ impl RefindMatcher {
             let offset = usize::from(pattern.slots[usize::from(base)]) * blocks;
             let equalities = &pattern.masks[offset..offset + blocks];
             // HW starts a new target substring for free at each column.
-            let mut carry = 0;
-            for ((state, &equal), &boundary) in states[..active]
+            let (mut positive_carry, mut negative_carry) = (0, 0);
+            for ((state, &equal), &shift) in states[..active]
                 .iter_mut()
                 .zip(equalities)
-                .zip(&pattern.boundaries)
+                .zip(&pattern.shifts)
             {
-                carry = advance_refind_block(state, equal, boundary, carry);
+                (positive_carry, negative_carry) =
+                    advance_block_bits(state, equal, shift, positive_carry, negative_carry);
             }
+            let carry = positive_carry as i8 - negative_carry as i8;
             if active < blocks
                 && states[active - 1]
                     .distance
@@ -300,14 +358,17 @@ impl RefindMatcher {
             // delta is positive, so the block minimum is at least its last-row
             // distance minus the number of positive deltas (which is never
             // weaker than the 63-row bound `distance >= bound + 64`).
+            // A last row at or below the bound keeps the block, so the
+            // popcount is only needed when it is above.
             while active > 1 && {
                 let state = &states[active - 1];
                 let used = (pattern.boundaries[active - 1] << 1).wrapping_sub(1);
-                state.distance >= bound + 64
-                    || state
-                        .distance
-                        .saturating_sub((state.positive & used).count_ones() as usize)
-                        > bound
+                state.distance > bound
+                    && (state.distance >= bound + 64
+                        || state
+                            .distance
+                            .saturating_sub((state.positive & used).count_ones() as usize)
+                            > bound)
             } {
                 active -= 1;
             }
@@ -344,9 +405,35 @@ impl RefindMatcher {
             .get_or_init(|| GlobalPattern::new(self.query.iter().rev().copied()));
         let find_start = |end: usize, scratch: &mut RefindScratch| {
             reverse.reset(&mut scratch.states);
+            let blocks = reverse.boundaries.len();
+            // Only cells within `best` of the diagonal can be at or below
+            // `best` (a cell is at least |i - j|), and only those decide
+            // whether the last row equals `best`. Blocks entirely below that
+            // band are started late from the upper-bound column `above + k`,
+            // and blocks entirely above it are dropped with the top-row carry
+            // of +1 per column fed to the next block. Both keep every cell an
+            // upper bound on its true value, exact whenever the true value is
+            // at most `best` (an optimal path never passes a larger cell), so
+            // the columns where the last row equals `best` are unchanged.
+            let mut low = 0;
+            let mut high = blocks.min(best.saturating_add(1) / 64 + 1);
             let mut start = None;
             for j in 1..=end.min(self.length.saturating_add(best)) {
-                if reverse.advance(&mut scratch.states, target[end - j]) == best {
+                while high < blocks && 64 * high < j + best {
+                    let width = (self.length - high * 64).min(64);
+                    scratch.states[high] = GlobalState {
+                        positive: u64::MAX,
+                        negative: 0,
+                        distance: scratch.states[high - 1].distance + width,
+                    };
+                    high += 1;
+                }
+                while low + 1 < high && j > 64 * (low + 1) + best {
+                    low += 1;
+                }
+                let distance =
+                    reverse.advance_range(&mut scratch.states, target[end - j], low, high);
+                if high == blocks && distance == best {
                     start = Some(end - j);
                 }
             }
@@ -363,8 +450,29 @@ impl RefindMatcher {
         forward.reset(&mut scratch.states);
         scratch.columns.clear();
         scratch.columns.reserve(width * forward.boundaries.len());
-        for &base in first_target {
-            forward.advance(&mut scratch.states, base);
+        // The traceback only visits cells at or below `best` and their
+        // immediate neighbours, so the same band as `find_start` applies,
+        // widened by a margin of two rows: blocks not yet started still hold
+        // their column-zero values (an upper bound for rows below the band),
+        // and dropped blocks are never read.
+        let blocks = forward.boundaries.len();
+        let mut low = 0;
+        let mut high = blocks.min(best.saturating_add(3) / 64 + 1);
+        for (column, &base) in first_target.iter().enumerate() {
+            let j = column + 1;
+            while high < blocks && 64 * high < j + best + 2 {
+                let width = (self.length - high * 64).min(64);
+                scratch.states[high] = GlobalState {
+                    positive: u64::MAX,
+                    negative: 0,
+                    distance: scratch.states[high - 1].distance + width,
+                };
+                high += 1;
+            }
+            while low + 1 < high && j > 64 * (low + 1) + best + 2 {
+                low += 1;
+            }
+            forward.advance_range(&mut scratch.states, base, low, high);
             scratch.columns.extend_from_slice(&scratch.states);
         }
         let (mut i, mut j) = (self.length, width);
@@ -912,6 +1020,50 @@ mod tests {
             assert_eq!(
                 matcher.align_with_scratch(&target, &mut scratch),
                 full_refind(&query, &target)
+            );
+        }
+    }
+
+    #[test]
+    fn block_recovery_band_matches_full_traceback() {
+        // Multi-block queries with divergence high enough that recovery takes
+        // the bit-parallel (not the scalar banded) path, so the band limits in
+        // `find_start` and the forward pass are exercised at many offsets,
+        // including copies near both ends of the padded target and endpoint ties.
+        let mut seed = 0x6a09_e667_f3bc_c908u64;
+        let mut scratch = RefindScratch::default();
+        for case in 0..360 {
+            let length = [65, 100, 127, 128, 129, 191, 192, 193, 300, 520, 700][case % 11];
+            let alphabet: &[u8] = if case % 3 == 0 { b"ACGTNEX" } else { b"ACGT" };
+            let query = random_sequence(length, alphabet, &mut seed);
+            let mut copy = query.clone();
+            let rate = [2usize, 3, 4, 6, 9, 15][case % 6];
+            let mut index = 0;
+            while index < copy.len() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                match seed % 3 {
+                    0 => copy[index] = b"ACGT"[(seed >> 8) as usize % 4],
+                    1 => copy.insert(index, b"ACGT"[(seed >> 8) as usize % 4]),
+                    _ => drop(copy.remove(index)),
+                }
+                index += 1 + (seed >> 16) as usize % rate;
+            }
+            let flank = [0, 3, length / 3, length][case % 4];
+            let mut target = random_sequence(flank, b"ACGT", &mut seed);
+            target.extend(&copy);
+            target.extend(random_sequence([length, 0, 7][case % 3], b"ACGT", &mut seed));
+            if case % 5 == 0 {
+                target.extend(&copy);
+            }
+            let padding = length / 2;
+            let target = [vec![b'E'; padding], target, vec![b'E'; padding]].concat();
+            let matcher = RefindMatcher::new(&query).unwrap();
+            assert_eq!(
+                matcher.align_with_scratch(&target, &mut scratch),
+                full_refind(&query, &target),
+                "case={case} length={length} rate={rate}"
             );
         }
     }
