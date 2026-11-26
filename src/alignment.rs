@@ -197,6 +197,7 @@ pub(crate) struct RefindScratch {
 }
 
 impl RefindScratch {
+    #[inline(always)]
     fn distance(&self, pattern: &GlobalPattern, row: usize, column: usize) -> usize {
         if row == 0 {
             return column;
@@ -252,6 +253,29 @@ impl RefindMatcher {
         target: &[u8],
         scratch: &mut RefindScratch,
     ) -> Option<RefindAlignment> {
+        // The baseline x86-64 target has no popcount instruction, and the
+        // block-pruning test and traceback popcount once per column. Use the
+        // instruction when the CPU has it; results are identical either way.
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("popcnt") {
+            // SAFETY: the CPU supports popcnt, checked just above.
+            return unsafe { self.align_with_popcnt(target, scratch) };
+        }
+        self.align_inner(target, scratch)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt")]
+    unsafe fn align_with_popcnt(
+        &self,
+        target: &[u8],
+        scratch: &mut RefindScratch,
+    ) -> Option<RefindAlignment> {
+        self.align_inner(target, scratch)
+    }
+
+    #[inline(always)]
+    fn align_inner(&self, target: &[u8], scratch: &mut RefindScratch) -> Option<RefindAlignment> {
         if target.is_empty() {
             return None;
         }
@@ -269,6 +293,7 @@ impl RefindMatcher {
         memchr::memmem::find(target, &self.query).map(|_| 0)
     }
 
+    #[inline(always)]
     fn single_pass_endpoints(
         &self,
         target: &[u8],
@@ -289,6 +314,7 @@ impl RefindMatcher {
         self.single_pass_endpoints_within(target, scratch, self.length)
     }
 
+    #[inline(always)]
     fn single_pass_endpoints_within(
         &self,
         target: &[u8],
@@ -376,6 +402,7 @@ impl RefindMatcher {
         (first != 0).then_some((bound, first, last))
     }
 
+    #[inline(always)]
     fn recover(
         &self,
         target: &[u8],
