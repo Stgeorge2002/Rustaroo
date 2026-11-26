@@ -4,14 +4,6 @@ Rustaroo is a Rust pipeline for pangenome analysis. It processes GFF annotations
 builds and cleans a gene-family graph, searches for missing genes, selects family
 reference sequences, and can generate alignments.
 
-## Status
-
-This checkout is experimental (`1.1.0-dev`), not the `v1.0.0` release. It is not
-a validated replacement for the baseline pipeline: family assignments,
-refinding, output formats, and performance can differ. In particular,
-experimental refinding can change named and `group_` families. See `--help` for
-the current CLI options.
-
 ## Build and run
 
 Install stable Rust and CD-HIT. Install MAFFT or PRANK if you want alignments.
