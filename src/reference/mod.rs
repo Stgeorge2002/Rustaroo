@@ -26,7 +26,9 @@ use petgraph::graph::NodeIndex;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
+#[cfg(test)]
+use std::io::BufReader;
 use std::path::Path;
 
 struct Member {

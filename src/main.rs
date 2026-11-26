@@ -410,12 +410,7 @@ fn run_rustaroo_pipeline(
         let csv_file = outdir_path.join(format!("input_{}.csv", i));
         if csv_file.exists() {
             let content = std::fs::read_to_string(&csv_file)?;
-            for (j, line) in content.lines().enumerate() {
-                if j > 0 {
-                    // Skip header
-                    writeln!(data_csv, "{}", line)?;
-                }
-            }
+            write_csv_body(&mut data_csv, &content)?;
         }
     }
     data_csv.flush()?;
@@ -647,4 +642,50 @@ fn run_rustaroo_pipeline(
     log::info!("Pipeline total: {:.3}s", total.as_secs_f64());
 
     Ok(())
+}
+
+/// Write every line of `content` after the header, each followed by `\n`,
+/// exactly as `for line in content.lines().skip(1) { writeln!(out, "{line}") }`.
+/// Without any `\r`, that output is the raw text after the first newline
+/// (plus a final newline if missing), so it is copied in one write.
+fn write_csv_body(out: &mut impl Write, content: &str) -> io::Result<()> {
+    if memchr::memchr(b'\r', content.as_bytes()).is_some() {
+        for line in content.lines().skip(1) {
+            writeln!(out, "{}", line)?;
+        }
+        return Ok(());
+    }
+    let Some(header_end) = memchr::memchr(b'\n', content.as_bytes()) else {
+        return Ok(());
+    };
+    let body = &content[header_end + 1..];
+    out.write_all(body.as_bytes())?;
+    if !body.is_empty() && !body.ends_with('\n') {
+        out.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_csv_body;
+    use std::io::Write;
+
+    #[test]
+    fn csv_body_copy_matches_line_loop() {
+        for content in [
+            "", "h", "h\n", "h\n\n", "h\na", "h\na\n", "h\na\nb", "h\na\n\nb\n\n",
+            "h\r\na\r\n", "h\na\rb\n", "h\na\r", "\n\n\n", "\na",
+        ] {
+            let mut expected = Vec::new();
+            for (j, line) in content.lines().enumerate() {
+                if j > 0 {
+                    writeln!(expected, "{}", line).unwrap();
+                }
+            }
+            let mut actual = Vec::new();
+            write_csv_body(&mut actual, content).unwrap();
+            assert_eq!(actual, expected, "{content:?}");
+        }
+    }
 }
