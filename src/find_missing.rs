@@ -312,8 +312,115 @@ impl RefindCache {
 
 struct CachedWindow {
     query_id: usize,
-    target: Box<str>,
+    target: PackedWindow,
     result: Option<RefindAlignment>,
+}
+
+/// A cached search window, stored two bits per base when it is pure
+/// upper-case ACGT (as nearly all contig windows are) and verbatim otherwise.
+/// Equality with a probe window is exact either way; packing only lets the
+/// fixed cache budget hold about four times as many windows, so fewer
+/// alignments are evicted and recomputed. The cache memoizes a pure function
+/// of (query, window), so its capacity never changes a result.
+struct PackedWindow {
+    len: usize,
+    packed: bool,
+    data: Box<[u8]>,
+}
+
+const fn base_code(base: u8) -> u8 {
+    match base {
+        b'A' => 0,
+        b'C' => 1,
+        b'G' => 2,
+        b'T' => 3,
+        _ => 4,
+    }
+}
+
+static BASE_CODES: [u8; 256] = {
+    let mut table = [4u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = base_code(i as u8);
+        i += 1;
+    }
+    table
+};
+
+/// The four ASCII bases encoded by one packed byte, as a little-endian word.
+static PACKED_QUADS: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut word = 0u32;
+        let mut k = 0;
+        while k < 4 {
+            word |= (b"ACGT"[(i >> (2 * k)) & 3] as u32) << (8 * k);
+            k += 1;
+        }
+        table[i] = word;
+        i += 1;
+    }
+    table
+};
+
+impl PackedWindow {
+    fn new(target: &str) -> Self {
+        let bytes = target.as_bytes();
+        if bytes.iter().all(|&base| BASE_CODES[usize::from(base)] < 4) {
+            let data = bytes
+                .chunks(4)
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .fold(0u8, |packed, (k, &base)| {
+                            packed | (BASE_CODES[usize::from(base)] << (2 * k))
+                        })
+                })
+                .collect();
+            Self {
+                len: bytes.len(),
+                packed: true,
+                data,
+            }
+        } else {
+            Self {
+                len: bytes.len(),
+                packed: false,
+                data: bytes.into(),
+            }
+        }
+    }
+
+    fn stored_bytes(&self) -> usize {
+        self.data.len()
+    }
+
+    fn matches(&self, target: &str) -> bool {
+        let bytes = target.as_bytes();
+        if bytes.len() != self.len {
+            return false;
+        }
+        if !self.packed {
+            return *self.data == *bytes;
+        }
+        let whole = bytes.len() / 4;
+        for (chunk, &packed) in bytes.chunks_exact(4).zip(&self.data[..whole]) {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if word != PACKED_QUADS[usize::from(packed)] {
+                return false;
+            }
+        }
+        let tail = &bytes[whole * 4..];
+        tail.is_empty() || {
+            let packed = self.data[whole];
+            tail.iter()
+                .enumerate()
+                .all(|(k, &base)| b"ACGT"[usize::from((packed >> (2 * k)) & 3)] == base)
+        }
+    }
 }
 
 #[derive(Default)]
@@ -369,13 +476,12 @@ impl AlignmentCache {
         target: &str,
         align: impl FnOnce() -> Option<RefindAlignment>,
     ) -> Option<RefindAlignment> {
-        let charge = target.len().saturating_add(ALIGNMENT_ENTRY_OVERHEAD);
-        debug_assert!(charge <= self.shard_budget);
+        debug_assert!(target.len().saturating_add(ALIGNMENT_ENTRY_OVERHEAD) <= self.shard_budget);
         let shard = &self.shards[key as usize % self.shards.len()];
         {
             let mut state = shard.lock();
             if let Some(window) = state.windows.get(&key) {
-                if window.query_id == query_id && window.target.as_ref() == target {
+                if window.query_id == query_id && window.target.matches(target) {
                     let result = window.result;
                     state.hits += 1;
                     return result;
@@ -385,21 +491,23 @@ impl AlignmentCache {
         }
 
         let result = align();
+        let stored = PackedWindow::new(target);
         let mut state = shard.lock();
         // A concurrent miss may already have populated the slot. Collisions
         // also leave the existing entry alone; neither case changes the result.
         if !state.windows.contains_key(&key) {
+            let charge = stored.stored_bytes().saturating_add(ALIGNMENT_ENTRY_OVERHEAD);
             while state.charged_bytes > self.shard_budget - charge {
                 let oldest = state.fifo.pop_front().expect("charged cache is not empty");
                 let evicted = state.windows.remove(&oldest).expect("FIFO key is cached");
-                state.charged_bytes -= evicted.target.len() + ALIGNMENT_ENTRY_OVERHEAD;
+                state.charged_bytes -= evicted.target.stored_bytes() + ALIGNMENT_ENTRY_OVERHEAD;
                 state.evictions += 1;
             }
             state.windows.insert(
                 key,
                 CachedWindow {
                     query_id,
-                    target: target.into(),
+                    target: stored,
                     result,
                 },
             );
@@ -1139,9 +1247,48 @@ mod tests {
     }
 
     #[test]
+    fn packed_windows_match_exactly() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        for length in [0usize, 1, 2, 3, 4, 5, 7, 8, 9, 63, 64, 65, 1001] {
+            for alphabet in [&b"ACGT"[..], &b"ACGTN"[..], &b"acgtACGT"[..]] {
+                let target: String = (0..length)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        alphabet[(seed % alphabet.len() as u64) as usize] as char
+                    })
+                    .collect();
+                let stored = PackedWindow::new(&target);
+                assert!(stored.matches(&target));
+                if alphabet == b"ACGT" {
+                    assert!(stored.packed);
+                    assert_eq!(stored.stored_bytes(), length.div_ceil(4));
+                }
+                // Every single-position change, and every length change, misses.
+                for position in 0..length.min(70) {
+                    for replacement in [b'A', b'C', b'G', b'T', b'N', b'a'] {
+                        let mut changed = target.clone().into_bytes();
+                        if changed[position] == replacement {
+                            continue;
+                        }
+                        changed[position] = replacement;
+                        assert!(!stored.matches(std::str::from_utf8(&changed).unwrap()));
+                    }
+                }
+                assert!(!stored.matches(&format!("{target}A")));
+                if length > 0 {
+                    assert!(!stored.matches(&target[..length - 1]));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn alignment_cache_requires_exact_keys_and_evicts_within_budget() {
         let target = "ACTG";
-        let budget = ALIGNMENT_ENTRY_OVERHEAD + target.len();
+        // Pure ACGT windows are charged at two bits per base.
+        let budget = ALIGNMENT_ENTRY_OVERHEAD + target.len().div_ceil(4);
         let cache = AlignmentCache::new(ALIGNMENT_CACHE_SHARDS * budget);
         let first = Some(RefindAlignment {
             distance: 0,
