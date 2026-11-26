@@ -31,7 +31,7 @@ use std::io::{BufWriter, Write};
 use std::io::BufReader;
 use std::path::Path;
 
-struct Member {
+pub struct Member {
     id: String,
     sample: usize,
     cluster: u32,
@@ -77,31 +77,125 @@ pub fn generate_pan_genome_reference(
     family_names: &HashMap<NodeIndex, String>,
     output_dir: &str,
 ) -> Result<()> {
+    let preload = preload_reference(graph, gene_data_file, input_files.len());
+    generate_pan_genome_reference_with(preload, graph, input_files, family_names, output_dir)
+}
+
+/// The first family-structure problem found while indexing members, in the
+/// original loop order (formatted later, as some messages need the name).
+enum StructureError {
+    TooManyFamilies(std::num::TryFromIntError),
+    NoMembers,
+    TooManyMembers(std::num::TryFromIntError),
+    Duplicate(String),
+}
+
+/// The part of reference generation that does not need family names:
+/// the member index of every final family and the member metadata read
+/// from gene_data.csv. It can run while the presence/absence output (which
+/// produces the names) is generated; `generate_pan_genome_reference_with`
+/// then reports any error in exactly the original order.
+pub struct ReferencePreload<'g> {
+    nodes: Vec<NodeIndex>,
+    /// Node position and kind of the first structural error, if any; the
+    /// families map and members are only complete without one.
+    structure_error: Option<(usize, StructureError)>,
+    members: Option<Result<Vec<Member>>>,
+    _graph: std::marker::PhantomData<&'g ()>,
+}
+
+pub fn preload_reference<'g>(
+    graph: &'g Graph<GeneNode, GeneEdge>,
+    gene_data_file: &str,
+    sample_count: usize,
+) -> ReferencePreload<'g> {
     let nodes: Vec<_> = graph.node_indices().collect();
     // Sequence ID -> (family, slot). Slots let `read_members` track which IDs
     // it has seen without a second string set.
     let mut families = FxMap::default();
+    let mut structure_error = None;
+    'nodes: for (position, &node) in nodes.iter().enumerate() {
+        let cluster = match u32::try_from(position) {
+            Ok(cluster) => cluster,
+            Err(error) => {
+                structure_error = Some((position, StructureError::TooManyFamilies(error)));
+                break;
+            }
+        };
+        if graph[node].seq_ids.is_empty() {
+            structure_error = Some((position, StructureError::NoMembers));
+            break;
+        }
+        for id in &graph[node].seq_ids {
+            let slot = match u32::try_from(families.len()) {
+                Ok(slot) => slot,
+                Err(error) => {
+                    structure_error = Some((position, StructureError::TooManyMembers(error)));
+                    break 'nodes;
+                }
+            };
+            if families.insert(id.as_str(), (cluster, slot)).is_some() {
+                structure_error = Some((position, StructureError::Duplicate(id.clone())));
+                break 'nodes;
+            }
+        }
+    }
+    let members = structure_error
+        .is_none()
+        .then(|| read_members(gene_data_file, &families, sample_count));
+    ReferencePreload {
+        nodes,
+        structure_error,
+        members,
+        _graph: std::marker::PhantomData,
+    }
+}
+
+/// Finish reference generation from a preload of the same graph.
+pub fn generate_pan_genome_reference_with(
+    preload: ReferencePreload<'_>,
+    graph: &Graph<GeneNode, GeneEdge>,
+    input_files: &[String],
+    family_names: &HashMap<NodeIndex, String>,
+    output_dir: &str,
+) -> Result<()> {
+    let ReferencePreload {
+        nodes,
+        structure_error,
+        members,
+        ..
+    } = preload;
+    // Same checks, in the same order, as the original single loop: per node,
+    // the name checks come before that node's structural checks.
     let mut names = HashSet::new();
-    for (cluster, &node) in nodes.iter().enumerate() {
+    for (position, &node) in nodes.iter().enumerate() {
         let name = family_names
             .get(&node)
             .context("Missing output family name")?;
         if name.is_empty() || name.chars().any(char::is_whitespace) || !names.insert(name) {
             bail!("Reference FASTA requires a unique, nonempty family identifier: {name:?}");
         }
-        let cluster = u32::try_from(cluster).context("Too many reference families")?;
-        if graph[node].seq_ids.is_empty() {
-            bail!("Family {name} has no member sequences for reference selection");
-        }
-        for id in &graph[node].seq_ids {
-            let slot = u32::try_from(families.len()).context("Too many reference members")?;
-            if families.insert(id.as_str(), (cluster, slot)).is_some() {
-                bail!("Sequence {id} belongs to more than one final family");
+        if let Some((error_position, error)) = &structure_error {
+            if *error_position == position {
+                match error {
+                    StructureError::TooManyFamilies(error) => {
+                        return Err(anyhow::Error::new(*error).context("Too many reference families"))
+                    }
+                    StructureError::NoMembers => {
+                        bail!("Family {name} has no member sequences for reference selection")
+                    }
+                    StructureError::TooManyMembers(error) => {
+                        return Err(anyhow::Error::new(*error).context("Too many reference members"))
+                    }
+                    StructureError::Duplicate(id) => {
+                        bail!("Sequence {id} belongs to more than one final family")
+                    }
+                }
             }
         }
     }
 
-    let mut members = read_members(gene_data_file, &families, input_files.len())?;
+    let mut members = members.expect("members are read when the structure is valid")?;
     let mut needed = vec![NeededAnnotations::default(); input_files.len()];
     for member in &members {
         if !member.refound {
@@ -131,11 +225,11 @@ pub fn generate_pan_genome_reference(
     let mut pools = Pools::default();
     // Interning maps: IDs are assigned in member order, never by map order.
     let mut dna_ids = FxMap::<String, usize>::default();
-    let mut protein_ids = FxMap::default();
-    let mut dna_proteins = Vec::new();
+    let mut protein_ids = FxMap::<Vec<u8>, usize>::default();
     let mut calls = Vec::with_capacity(members.len());
     // Rustaroo's physical-locus tests require genomic order, not HashSet order.
-    members.sort_by(|a, b| a.id.cmp(&b.id));
+    // (Stable sorts, as before; the parallel one gives the same order.)
+    members.par_sort_by(|a, b| a.id.cmp(&b.id));
     for member in members {
         let sample = &locations[member.sample];
         let contig = *sample.contigs.get(&member.scaffold).with_context(|| {
@@ -162,21 +256,9 @@ pub fn generate_pan_genome_reference(
             None => {
                 let id = pools.dna.len();
                 pools.dna.push(member.dna.clone());
-                dna_ids.insert(member.dna.clone(), id);
+                dna_ids.insert(member.dna, id);
                 id
             }
-        };
-        let protein = if dna < dna_proteins.len() {
-            dna_proteins[dna]
-        } else {
-            let protein = translate(&member.dna);
-            let protein = *protein_ids.entry(protein.clone()).or_insert_with(|| {
-                let id = pools.protein.len();
-                pools.protein.push(protein);
-                id
-            });
-            dna_proteins.push(protein);
-            protein
         };
         calls.push((
             member.id,
@@ -187,14 +269,37 @@ pub fn generate_pan_genome_reference(
                 end: location.end,
                 strand: location.strand,
                 dna: u32::try_from(dna)?,
-                protein: u32::try_from(protein)?,
+                // Filled in below, once every allele is known.
+                protein: 0,
                 cluster: member.cluster,
                 locus: None,
                 refound: member.refound,
             },
         ));
     }
-    calls.sort_by_key(|(_, call)| (call.sample, call.contig, call.start, call.end));
+    // Protein IDs are assigned in order of each allele's first appearance,
+    // which is DNA ID order; translating the alleles in parallel and then
+    // interning them in that order gives the same IDs as translating each
+    // new allele inside the loop above. (A protein ID never exceeds its DNA
+    // ID, so its u32 conversion cannot fail where the DNA one did not.)
+    let translated: Vec<Vec<u8>> = pools.dna.par_iter().map(|dna| translate(dna)).collect();
+    let mut dna_proteins = Vec::with_capacity(translated.len());
+    for protein in translated {
+        let id = match protein_ids.get(protein.as_slice()) {
+            Some(&id) => id,
+            None => {
+                let id = pools.protein.len();
+                pools.protein.push(protein.clone());
+                protein_ids.insert(protein, id);
+                id
+            }
+        };
+        dna_proteins.push(u32::try_from(id)?);
+    }
+    for (_, call) in &mut calls {
+        call.protein = dna_proteins[call.dna as usize];
+    }
+    calls.par_sort_by_key(|(_, call)| (call.sample, call.contig, call.start, call.end));
     let (member_ids, calls): (Vec<_>, Vec<_>) = calls.into_iter().unzip();
     drop(dna_ids);
     drop(protein_ids);

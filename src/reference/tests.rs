@@ -412,3 +412,45 @@ fn finalized_real_graph_remains_unchanged() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn preloaded_reference_reports_family_errors_in_original_order() {
+    fn node(ids: &[&str]) -> GeneNode {
+        GeneNode {
+            seq_ids: ids.iter().map(|id| id.to_string()).collect(),
+            ..GeneNode::default()
+        }
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let data = dir.path().join("gene_data.csv");
+    std::fs::write(&data, metadata_header()).unwrap();
+    let out = dir.path().to_str().unwrap().to_string();
+    // (families, names); None = missing name. Expected first error message.
+    let cases: Vec<(Vec<Vec<&str>>, Vec<Option<&str>>, &str)> = vec![
+        // Duplicate member in node 1 precedes a bad name in node 2.
+        (vec![vec!["a"], vec!["a"], vec!["b"]], vec![Some("x"), Some("y"), Some("bad name")], "Sequence a belongs to more than one final family"),
+        // A bad name in node 1 precedes node 1's own structural error.
+        (vec![vec!["a"], vec![], vec!["b"]], vec![Some("x"), Some("x"), Some("z")], "unique, nonempty family identifier"),
+        // An empty family's message carries its name.
+        (vec![vec!["a"], vec![], vec!["b"]], vec![Some("x"), Some("y"), None], "Family y has no member sequences"),
+        // A missing name before the structural error.
+        (vec![vec!["a"], vec!["b"], vec!["b"]], vec![Some("x"), None, Some("z")], "Missing output family name"),
+        // No structural error: name errors anywhere are still found.
+        (vec![vec!["a"], vec!["b"]], vec![Some("x"), Some("")], "unique, nonempty family identifier"),
+    ];
+    for (families, names, expected) in cases {
+        let mut graph = Graph::<GeneNode, GeneEdge>::default();
+        let mut family_names = HashMap::new();
+        for (ids, name) in families.iter().zip(&names) {
+            let index = graph.add_node(node(ids));
+            if let Some(name) = name {
+                family_names.insert(index, name.to_string());
+            }
+        }
+        let preload = preload_reference(&graph, data.to_str().unwrap(), 0);
+        let error = generate_pan_genome_reference_with(preload, &graph, &[], &family_names, &out)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error:?} should contain {expected:?}");
+    }
+}

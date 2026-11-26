@@ -12,7 +12,9 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-pub use crate::reference::generate_pan_genome_reference;
+pub use crate::reference::{
+    generate_pan_genome_reference, generate_pan_genome_reference_with, preload_reference,
+};
 
 /// Generate Roary-style gene presence/absence CSV
 pub fn generate_roary_gene_presence_absence(

@@ -603,51 +603,71 @@ fn run_rustaroo_pipeline(
         mems_to_isolates.insert(i, name);
     }
 
-    // Same as load_annotation_ids on the final gene_data.csv: the map of its
-    // initial contents, extended with any lines refinding appended.
-    let orig_ids = match refind_ids {
-        Some(ids) => {
-            find_missing::load_annotation_ids_from(
-                data_file.to_str().unwrap(),
-                ids,
-                gene_data_len,
-                annotation_lines,
-            )?
-            .0
-        }
-        None => annotation_ids
-            .take()
-            .expect("annotation IDs are consumed only by refinding")?,
-    };
+    let data_path = data_file.to_str().unwrap();
+    // The reference's member index and gene_data.csv metadata do not depend
+    // on the family names, so they are read while the presence/absence
+    // output (which assigns the names) is generated. Errors are reported in
+    // the original order: presence/absence first, then the reference's.
+    let (family_names, reference_preload) = rayon::join(
+        || -> Result<_> {
+            // Same as load_annotation_ids on the final gene_data.csv: the map
+            // of its initial contents, extended with any lines refinding appended.
+            let orig_ids = match refind_ids {
+                Some(ids) => {
+                    find_missing::load_annotation_ids_from(
+                        data_path,
+                        ids,
+                        gene_data_len,
+                        annotation_lines,
+                    )?
+                    .0
+                }
+                None => annotation_ids
+                    .take()
+                    .expect("annotation IDs are consumed only by refinding")?,
+            };
 
-    // Generate presence/absence matrix
-    let family_names = output::generate_roary_gene_presence_absence(
-        &graph,
-        &mems_to_isolates,
-        &orig_ids,
-        &outdir,
-    )?;
+            // Generate presence/absence matrix
+            output::generate_roary_gene_presence_absence(
+                &graph,
+                &mems_to_isolates,
+                &orig_ids,
+                &outdir,
+            )
+        },
+        || output::preload_reference(&graph, data_path, rustaroo_args.input_files.len()),
+    );
+    let family_names = family_names?;
     timings.push(("Presence/absence output", stage_started.elapsed()));
 
-    // Generate pan-genome reference
-    let stage_started = Instant::now();
-    output::generate_pan_genome_reference(
-        &graph,
-        data_file.to_str().unwrap(),
-        &rustaroo_args.input_files,
-        &family_names,
-        &outdir,
-    )?;
-    timings.push(("Reference generation", stage_started.elapsed()));
+    // Generate pan-genome reference (and, alongside it, the graph files,
+    // which are independent outputs)
+    let reference = || -> Result<std::time::Duration> {
+        let stage_started = Instant::now();
+        output::generate_pan_genome_reference_with(
+            reference_preload,
+            &graph,
+            &rustaroo_args.input_files,
+            &family_names,
+            &outdir,
+        )?;
+        Ok(stage_started.elapsed())
+    };
 
     if args.minimal {
+        timings.push(("Reference generation", reference()?));
         log::info!("Generated presence/absence matrix and reference");
     } else {
-        let stage_started = Instant::now();
-        let gml_file = outdir_path.join("final_graph.gml");
-        output::write_gml(&graph, gml_file.to_str().unwrap())?;
-        output::write_summary_stats(&graph, &outdir, all_genes.len())?;
-        timings.push(("Graph and summary output", stage_started.elapsed()));
+        let graph_files = || -> Result<std::time::Duration> {
+            let stage_started = Instant::now();
+            let gml_file = outdir_path.join("final_graph.gml");
+            output::write_gml(&graph, gml_file.to_str().unwrap())?;
+            output::write_summary_stats(&graph, &outdir, all_genes.len())?;
+            Ok(stage_started.elapsed())
+        };
+        let (reference_elapsed, graph_elapsed) = rayon::join(reference, graph_files);
+        timings.push(("Reference generation", reference_elapsed?));
+        timings.push(("Graph and summary output", graph_elapsed?));
         log::info!("Generated presence/absence matrix, reference, and graph files");
     }
     log::info!(
