@@ -358,6 +358,31 @@ pub fn collapse_families(
     )
 }
 
+fn node_member_centroids(
+    graph: &Graph<GeneNode, GeneEdge>,
+    node: NodeIndex,
+    seqid_to_centroid: &HashMap<String, String>,
+    index: &FamilyIndex,
+) -> Result<HashMap<usize, HashSet<usize>>> {
+    let mut members = HashMap::<usize, HashSet<usize>>::new();
+    for seq_id in &graph[node].seq_ids {
+        let member = crate::network::genome_prefix(seq_id).parse::<usize>()?;
+        let centroid = if seq_id.contains("refound") {
+            &graph[node].long_centroid_id.1
+        } else {
+            seqid_to_centroid
+                .get(seq_id)
+                .ok_or_else(|| anyhow::anyhow!("Missing centroid for sequence {}", seq_id))?
+        };
+        let centroid_index = index
+            .centroid_to_index
+            .get(centroid)
+            .ok_or_else(|| anyhow::anyhow!("Missing indexed centroid {}", centroid))?;
+        members.entry(member).or_default().insert(*centroid_index);
+    }
+    Ok(members)
+}
+
 pub fn collapse_families_indexed(
     graph: &mut Graph<GeneNode, GeneEdge>,
     seqid_to_centroid: &HashMap<String, String>,
@@ -368,25 +393,21 @@ pub fn collapse_families_indexed(
     outlier_support: f64,
 ) -> Result<()> {
     let mut next_order = next_creation_order(graph);
+    // Per-node member -> centroid-index sets are independent, so they are
+    // built in parallel; results (and the first error, in node order) are
+    // taken in the same order as the original serial loop.
+    let nodes: Vec<NodeIndex> = graph.node_indices().collect();
+    let built: Vec<Result<HashMap<usize, HashSet<usize>>>> = {
+        use rayon::prelude::*;
+        let graph = &*graph;
+        nodes
+            .par_iter()
+            .map(|&node| node_member_centroids(graph, node, seqid_to_centroid, index))
+            .collect()
+    };
     let mut node_members: HashMap<NodeIndex, HashMap<usize, HashSet<usize>>> = HashMap::new();
-    for node in graph.node_indices() {
-        let mut members = HashMap::<usize, HashSet<usize>>::new();
-        for seq_id in &graph[node].seq_ids {
-            let member = seq_id.split('_').next().unwrap_or("").parse::<usize>()?;
-            let centroid = if seq_id.contains("refound") {
-                &graph[node].long_centroid_id.1
-            } else {
-                seqid_to_centroid
-                    .get(seq_id)
-                    .ok_or_else(|| anyhow::anyhow!("Missing centroid for sequence {}", seq_id))?
-            };
-            let centroid_index = index
-                .centroid_to_index
-                .get(centroid)
-                .ok_or_else(|| anyhow::anyhow!("Missing indexed centroid {}", centroid))?;
-            members.entry(member).or_default().insert(*centroid_index);
-        }
-        node_members.insert(node, members);
+    for (node, members) in nodes.into_iter().zip(built) {
+        node_members.insert(node, members?);
     }
     let mut bfs_scratch = BfsScratch::default();
 

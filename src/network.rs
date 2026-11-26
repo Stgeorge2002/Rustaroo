@@ -1,6 +1,7 @@
 //! Pangenome network generation from CD-HIT clusters
 //!
 
+use crate::line_reader::LineReader;
 use anyhow::{Context, Result};
 use petgraph::graph::{EdgeIndex, NodeIndex};
 use petgraph::stable_graph::StableGraph;
@@ -11,6 +12,16 @@ use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type Graph<N, E> = StableGraph<N, E, Undirected>;
+
+/// The genome part of a sequence ID: everything before the first `_`
+/// (the whole ID if it has none), exactly `id.split('_').next().unwrap()`.
+#[inline]
+pub(crate) fn genome_prefix(id: &str) -> &str {
+    match id.as_bytes().iter().position(|&byte| byte == b'_') {
+        Some(end) => &id[..end],
+        None => id,
+    }
+}
 
 /// Gene node in the pangenome graph
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -118,7 +129,7 @@ pub fn generate_network(
     for (cluster, members) in &cluster_members {
         let genomes: Vec<&str> = members
             .iter()
-            .map(|s| s.split('_').next().unwrap())
+            .map(|s| genome_prefix(s))
             .collect();
         let unique_genomes: HashSet<_> = genomes.into_iter().collect();
         if members.len() != unique_genomes.len() {
@@ -153,16 +164,15 @@ fn parse_cluster_file(
     HashMap<usize, String>,
     HashMap<usize, Vec<String>>,
 )> {
-    let file = File::open(cluster_file)
+    let mut lines = LineReader::open(cluster_file)
         .with_context(|| format!("Failed to open cluster file: {}", cluster_file))?;
-    let reader = BufReader::new(file);
 
     let mut seq_to_cluster = HashMap::new();
     let mut cluster_centroids = HashMap::new();
     let mut cluster_members: HashMap<usize, Vec<String>> = HashMap::new();
     let mut current_cluster = 0;
 
-    for line in reader.lines() {
+    while let Some(line) = lines.next_line() {
         let line = line?;
         if line.starts_with('>') {
             // New cluster
@@ -171,15 +181,16 @@ fn parse_cluster_file(
                 .last()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-        } else if line.contains('>') {
-            // Sequence in cluster
-            let parts: Vec<&str> = line.split('>').collect();
-            if parts.len() >= 2 {
-                let seq_id = parts[1].split("...").next().unwrap_or("").to_string();
+        } else if let Some((_, after)) = line.split_once('>') {
+            // Sequence in cluster. `after` up to the next '>' is the second
+            // piece of `line.split('>')`, which always exists here.
+            {
+                let second = after.split('>').next().unwrap_or("");
+                let seq_id = second.split("...").next().unwrap_or("").to_string();
                 seq_to_cluster.insert(seq_id.clone(), current_cluster);
 
                 // Get genome ID (first part before _)
-                let genome_id = seq_id.split('_').next().unwrap_or("").to_string();
+                let genome_id = genome_prefix(&seq_id).to_string();
                 cluster_members
                     .entry(current_cluster)
                     .or_insert_with(Vec::new)
@@ -202,25 +213,35 @@ fn load_cluster_data(
     cluster_centroids: &HashMap<usize, String>,
     seq_to_cluster: &HashMap<String, usize>,
 ) -> Result<HashMap<usize, ClusterData>> {
-    let file = File::open(data_file)
+    let mut lines = LineReader::open(data_file)
         .with_context(|| format!("Failed to open data file: {}", data_file))?;
-    let reader = BufReader::new(file);
 
     let centroid_ids: HashSet<_> = cluster_centroids.values().cloned().collect();
     let mut cluster_data = HashMap::new();
     let mut standard_schema = false;
 
-    for (i, line) in reader.lines().enumerate() {
+    let mut i = 0usize;
+    while let Some(line) = lines.next_line() {
         let line = line?;
         if i == 0 {
+            i += 1;
             standard_schema = line.starts_with("gff_file,scaffold_name,");
             continue;
         }
-        let fields: Vec<&str> = line.split(',').collect();
+        i += 1;
+        // Only the first eight fields are read; "at least seven fields" is
+        // the same test on the first eight.
+        let mut fields = [""; 8];
+        let mut count = 0;
+        for field in line.split(',').take(8) {
+            fields[count] = field;
+            count += 1;
+        }
+        let fields = &fields[..count];
         if fields.len() >= 7 {
-            let seq_id = fields[2].to_string();
-            if centroid_ids.contains(&seq_id) {
-                if let Some(&cluster) = seq_to_cluster.get(&seq_id) {
+            let seq_id = fields[2];
+            if centroid_ids.contains(seq_id) {
+                if let Some(&cluster) = seq_to_cluster.get(seq_id) {
                     cluster_data.insert(
                         cluster,
                         ClusterData {
@@ -284,7 +305,7 @@ fn build_graph(
 )> {
     let mut graph: Graph<GeneNode, GeneEdge> = Graph::default();
     let mut centroid_context: HashMap<String, Vec<(NodeIndex, usize)>> = HashMap::new();
-    let mut seqid_to_centroid = HashMap::new();
+    let mut seqid_to_centroid = HashMap::with_capacity(seq_ids.len());
     let mut node_map: HashMap<usize, NodeIndex> = HashMap::new();
     let mut edge_index = HashMap::new();
     let mut prev: Option<NodeIndex> = None;
@@ -300,16 +321,16 @@ fn build_graph(
         };
 
         let centroid = match cluster_centroids.get(&current_cluster) {
-            Some(c) => c.clone(),
+            Some(c) => c,
             None => continue,
         };
 
         seqid_to_centroid.insert(seq_id.clone(), centroid.clone());
 
-        let parts: Vec<&str> = seq_id.split('_').collect();
-        let genome_id: usize = parts[0].parse().unwrap_or(0);
+        let mut parts = seq_id.split('_');
+        let genome_id: usize = parts.next().unwrap_or("").parse().unwrap_or(0);
         let scaffold = parts
-            .get(1)
+            .next()
             .context("Sequence ID is missing its scaffold index")?
             .parse::<usize>()?;
         let is_contig_start = previous_location != Some((genome_id, scaffold));
@@ -591,6 +612,71 @@ mod tests {
     }
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn genome_prefix_matches_split() {
+        for id in ["", "_", "12", "12_3_4", "_x", "7__", "a_b", "0_refound_1"] {
+            assert_eq!(genome_prefix(id), id.split('_').next().unwrap());
+        }
+    }
+
+    /// The pre-optimisation parser, kept to check the streaming one.
+    fn parse_cluster_file_reference(
+        cluster_file: &str,
+    ) -> (
+        HashMap<String, usize>,
+        HashMap<usize, String>,
+        HashMap<usize, Vec<String>>,
+    ) {
+        let reader = BufReader::new(File::open(cluster_file).unwrap());
+        let mut seq_to_cluster = HashMap::new();
+        let mut cluster_centroids = HashMap::new();
+        let mut cluster_members: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut current_cluster = 0;
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if line.starts_with('>') {
+                current_cluster = line
+                    .split_whitespace()
+                    .last()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+            } else if line.contains('>') {
+                let parts: Vec<&str> = line.split('>').collect();
+                if parts.len() >= 2 {
+                    let seq_id = parts[1].split("...").next().unwrap_or("").to_string();
+                    seq_to_cluster.insert(seq_id.clone(), current_cluster);
+                    let genome_id = seq_id.split('_').next().unwrap_or("").to_string();
+                    cluster_members
+                        .entry(current_cluster)
+                        .or_insert_with(Vec::new)
+                        .push(genome_id);
+                    if line.trim().ends_with('*') {
+                        cluster_centroids.insert(current_cluster, seq_id);
+                    }
+                }
+            }
+        }
+        (seq_to_cluster, cluster_centroids, cluster_members)
+    }
+
+    #[test]
+    fn parse_cluster_file_matches_reference_parser() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            ">Cluster 0\n0\t1293aa, >0_0_0... *\n1\t1290aa, >1_0_5... at 99.15%\r\n\
+             >Cluster 7\n0\t10aa, >2_3_1...\n1\t10aa, >odd>name... *  \n\
+             junk line\n0\t5aa, >nodots\n>Cluster x\n0\t5aa, >3_1_1... *"
+        )
+        .unwrap();
+        let path = file.path().to_str().unwrap();
+        let (a, b, c) = parse_cluster_file(path).unwrap();
+        let (x, y, z) = parse_cluster_file_reference(path);
+        assert_eq!(a, x);
+        assert_eq!(b, y);
+        assert_eq!(c, z);
+    }
 
     #[test]
     fn test_gene_node_creation() {
