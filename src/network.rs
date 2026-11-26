@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use petgraph::graph::{EdgeIndex, NodeIndex};
 use petgraph::stable_graph::StableGraph;
 use petgraph::Undirected;
+use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -236,44 +237,76 @@ fn load_cluster_data(
 
     let centroid_ids: HashSet<_> = cluster_centroids.values().cloned().collect();
     let mut cluster_data = HashMap::new();
-    let mut standard_schema = false;
 
-    let mut i = 0usize;
-    while let Some(line) = lines.next_line() {
-        let line = line?;
-        if i == 0 {
-            i += 1;
-            standard_schema = line.starts_with("gff_file,scaffold_name,");
-            continue;
-        }
-        i += 1;
-        // Only the first eight fields are read; "at least seven fields" is
-        // the same test on the first eight.
-        let mut fields = [""; 8];
-        let mut count = 0;
-        for field in line.split(',').take(8) {
-            fields[count] = field;
-            count += 1;
-        }
-        let fields = &fields[..count];
-        if fields.len() >= 7 {
-            let seq_id = fields[2];
-            if centroid_ids.contains(seq_id) {
-                if let Some(&cluster) = seq_to_cluster.get(seq_id) {
-                    cluster_data.insert(
-                        cluster,
-                        ClusterData {
-                            prot_sequence: fields[4].to_string(),
-                            dna_sequence: fields[if standard_schema { 5 } else { 3 }].to_string(),
-                            annotation: fields[6].to_string(),
-                            description: if standard_schema {
-                                fields.get(7).unwrap_or(&"").to_string()
-                            } else {
-                                fields[5].to_string()
-                            },
-                        },
-                    );
+    // The header (first line) decides the schema; the remaining lines are
+    // scanned in parallel line ranges and applied in file order, so later
+    // lines overwrite earlier ones and the first error wins, as before.
+    let standard_schema = match lines.next_line() {
+        None => None,
+        Some(line) => Some(line?.starts_with("gff_file,scaffold_name,")),
+    };
+    if let Some(standard_schema) = standard_schema {
+        let body_start = lines.position();
+        drop(lines);
+        let ranges = crate::line_reader::line_chunks(
+            data_file,
+            body_start,
+            rayon::current_num_threads(),
+        )?;
+        let chunks: Vec<_> = ranges
+            .into_par_iter()
+            .map(|(start, end)| -> (Vec<(usize, ClusterData)>, Option<std::io::Error>) {
+                let mut found = Vec::new();
+                let mut lines = match LineReader::open_range(data_file, start, end) {
+                    Ok(lines) => lines,
+                    Err(error) => return (found, Some(error)),
+                };
+                while let Some(line) = lines.next_line() {
+                    let line = match line {
+                        Ok(line) => line,
+                        Err(error) => return (found, Some(error)),
+                    };
+                    // Only the first eight fields are read; "at least seven
+                    // fields" is the same test on the first eight.
+                    let mut fields = [""; 8];
+                    let mut count = 0;
+                    for field in line.split(',').take(8) {
+                        fields[count] = field;
+                        count += 1;
+                    }
+                    let fields = &fields[..count];
+                    if fields.len() >= 7 {
+                        let seq_id = fields[2];
+                        if centroid_ids.contains(seq_id) {
+                            if let Some(&cluster) = seq_to_cluster.get(seq_id) {
+                                found.push((
+                                    cluster,
+                                    ClusterData {
+                                        prot_sequence: fields[4].to_string(),
+                                        dna_sequence: fields
+                                            [if standard_schema { 5 } else { 3 }]
+                                        .to_string(),
+                                        annotation: fields[6].to_string(),
+                                        description: if standard_schema {
+                                            fields.get(7).unwrap_or(&"").to_string()
+                                        } else {
+                                            fields[5].to_string()
+                                        },
+                                    },
+                                ));
+                            }
+                        }
+                    }
                 }
+                (found, None)
+            })
+            .collect();
+        for (found, error) in chunks {
+            for (cluster, data) in found {
+                cluster_data.insert(cluster, data);
+            }
+            if let Some(error) = error {
+                return Err(error.into());
             }
         }
     }

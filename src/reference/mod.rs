@@ -460,6 +460,117 @@ fn select(
     })
 }
 
+/// The first error in one chunk of gene_data.csv, in line order.
+enum MemberError {
+    /// Reported as is (I/O, UTF-8, or a field error found after the
+    /// member's duplicate check, whose slot and ID are kept so the
+    /// duplicate check can still come first).
+    Plain(anyhow::Error, Option<(u32, String)>),
+    /// "Invalid reference metadata" at this chunk-local line.
+    InvalidAt(usize),
+}
+
+struct MemberChunk {
+    members: Vec<(u32, Member)>,
+    lines: usize,
+    error: Option<MemberError>,
+}
+
+/// Parse one line range of gene_data.csv exactly as the serial loop did,
+/// except for the duplicate check, which needs every earlier line and is
+/// done when the chunks are merged in order.
+fn read_member_chunk(
+    path: &str,
+    (start, end): (u64, u64),
+    families: &FxMap<&str, (u32, u32)>,
+    sample_count: usize,
+) -> MemberChunk {
+    let mut chunk = MemberChunk {
+        members: Vec::new(),
+        lines: 0,
+        error: None,
+    };
+    let mut lines = match LineReader::open_range(path, start, end) {
+        Ok(lines) => lines,
+        Err(error) => {
+            chunk.error = Some(MemberError::Plain(error.into(), None));
+            return chunk;
+        }
+    };
+    while let Some(line) = lines.next_line() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                chunk.error = Some(MemberError::Plain(error.into(), None));
+                return chunk;
+            }
+        };
+        let mut fields = [""; 8];
+        let mut count = 0;
+        for field in line.splitn(8, ',') {
+            fields[count] = field;
+            count += 1;
+        }
+        let current_line = chunk.lines;
+        chunk.lines += 1;
+        if count < 3 {
+            continue;
+        }
+        let Some(&(cluster, slot)) = families.get(fields[2]) else {
+            continue;
+        };
+        if count != 8 {
+            chunk.error = Some(MemberError::InvalidAt(current_line));
+            return chunk;
+        }
+        let id = fields[2];
+        match parse_member(&fields, cluster, sample_count) {
+            Ok(member) => chunk.members.push((slot, member)),
+            Err(error) => {
+                chunk.error = Some(MemberError::Plain(error, Some((slot, id.to_string()))));
+                return chunk;
+            }
+        }
+    }
+    chunk
+}
+
+/// The checks and fields after the duplicate-ID check, in the original order.
+fn parse_member(fields: &[&str; 8], cluster: u32, sample_count: usize) -> Result<Member> {
+    let id = fields[2];
+    let sample: usize = id
+        .split('_')
+        .next()
+        .context("Missing member genome ID")?
+        .parse()
+        .with_context(|| format!("Invalid genome ID in {id}"))?;
+    if sample >= sample_count {
+        bail!("Genome ID out of range in reference member {id}");
+    }
+    let dna = uppercase_dna(fields[5]);
+    if dna.is_empty() {
+        bail!("Empty reference member sequence {id}");
+    }
+    let refound = id.contains("refound");
+    Ok(Member {
+        id: id.into(),
+        sample,
+        cluster,
+        scaffold: fields[1].into(),
+        annotation: fields[3].into(),
+        dna,
+        refound,
+        location: if refound {
+            Some(refound_location(fields[7], id)?)
+        } else {
+            None
+        },
+    })
+}
+
+/// Members of the final families, in gene_data.csv order. The file is
+/// parsed in parallel line ranges; merging them in order replays the serial
+/// loop, so results and the first error are the same.
 fn read_members(
     path: &str,
     families: &FxMap<&str, (u32, u32)>,
@@ -475,59 +586,37 @@ fn read_members(
     ) {
         bail!("Reference selection requires the eight-column gene_data.csv schema");
     }
-    let mut line_number = 0usize;
-    while let Some(line) = lines.next_line() {
-        let line = line?;
-        let mut fields = [""; 8];
-        let mut count = 0;
-        for field in line.splitn(8, ',') {
-            fields[count] = field;
-            count += 1;
+    let body_start = lines.position();
+    drop(lines);
+    let ranges = crate::line_reader::line_chunks(path, body_start, rayon::current_num_threads())?;
+    let chunks: Vec<_> = ranges
+        .into_par_iter()
+        .map(|range| read_member_chunk(path, range, families, sample_count))
+        .collect();
+    let mut line_offset = 0usize;
+    for chunk in chunks {
+        for (slot, member) in chunk.members {
+            if std::mem::replace(&mut seen[slot as usize], true) {
+                bail!("Duplicate reference member ID {}", member.id);
+            }
+            seen_count += 1;
+            members.push(member);
         }
-        let current_line = line_number;
-        line_number += 1;
-        if count < 3 {
-            continue;
+        match chunk.error {
+            None => {}
+            Some(MemberError::InvalidAt(line)) => {
+                bail!("Invalid reference metadata at {}:{}", path, line_offset + line + 2);
+            }
+            Some(MemberError::Plain(error, member)) => {
+                if let Some((slot, id)) = member {
+                    if seen[slot as usize] {
+                        bail!("Duplicate reference member ID {id}");
+                    }
+                }
+                return Err(error);
+            }
         }
-        let Some(&(cluster, slot)) = families.get(fields[2]) else {
-            continue;
-        };
-        if count != 8 {
-            bail!("Invalid reference metadata at {}:{}", path, current_line + 2);
-        }
-        let id = fields[2];
-        if std::mem::replace(&mut seen[slot as usize], true) {
-            bail!("Duplicate reference member ID {id}");
-        }
-        seen_count += 1;
-        let sample: usize = id
-            .split('_')
-            .next()
-            .context("Missing member genome ID")?
-            .parse()
-            .with_context(|| format!("Invalid genome ID in {id}"))?;
-        if sample >= sample_count {
-            bail!("Genome ID out of range in reference member {id}");
-        }
-        let dna = uppercase_dna(fields[5]);
-        if dna.is_empty() {
-            bail!("Empty reference member sequence {id}");
-        }
-        let refound = id.contains("refound");
-        members.push(Member {
-            id: id.into(),
-            sample,
-            cluster,
-            scaffold: fields[1].into(),
-            annotation: fields[3].into(),
-            dna,
-            refound,
-            location: if refound {
-                Some(refound_location(fields[7], id)?)
-            } else {
-                None
-            },
-        });
+        line_offset += chunk.lines;
     }
     if seen_count != families.len() {
         if let Some(missing) = families

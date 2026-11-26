@@ -454,3 +454,150 @@ fn preloaded_reference_reports_family_errors_in_original_order() {
         assert!(error.contains(expected), "{error:?} should contain {expected:?}");
     }
 }
+
+/// The serial loop `read_members` replaced, kept to check the chunked one.
+fn read_members_serial(
+    path: &str,
+    families: &FxMap<&str, (u32, u32)>,
+    sample_count: usize,
+) -> Result<Vec<Member>> {
+    let mut members = Vec::with_capacity(families.len());
+    let mut seen = vec![false; families.len()];
+    let mut seen_count = 0usize;
+    let mut lines = crate::line_reader::LineReader::open(path)?;
+    let header = lines.next_line().context("Empty reference metadata")??;
+    if !header.starts_with(
+        "gff_file,scaffold_name,clustering_id,annotation_id,prot_sequence,dna_sequence,",
+    ) {
+        bail!("Reference selection requires the eight-column gene_data.csv schema");
+    }
+    let mut line_number = 0usize;
+    while let Some(line) = lines.next_line() {
+        let line = line?;
+        let mut fields = [""; 8];
+        let mut count = 0;
+        for field in line.splitn(8, ',') {
+            fields[count] = field;
+            count += 1;
+        }
+        let current_line = line_number;
+        line_number += 1;
+        if count < 3 {
+            continue;
+        }
+        let Some(&(cluster, slot)) = families.get(fields[2]) else {
+            continue;
+        };
+        if count != 8 {
+            bail!("Invalid reference metadata at {}:{}", path, current_line + 2);
+        }
+        let id = fields[2];
+        if std::mem::replace(&mut seen[slot as usize], true) {
+            bail!("Duplicate reference member ID {id}");
+        }
+        seen_count += 1;
+        let sample: usize = id
+            .split('_')
+            .next()
+            .context("Missing member genome ID")?
+            .parse()
+            .with_context(|| format!("Invalid genome ID in {id}"))?;
+        if sample >= sample_count {
+            bail!("Genome ID out of range in reference member {id}");
+        }
+        let dna = uppercase_dna(fields[5]);
+        if dna.is_empty() {
+            bail!("Empty reference member sequence {id}");
+        }
+        let refound = id.contains("refound");
+        members.push(Member {
+            id: id.into(),
+            sample,
+            cluster,
+            scaffold: fields[1].into(),
+            annotation: fields[3].into(),
+            dna,
+            refound,
+            location: if refound {
+                Some(refound_location(fields[7], id)?)
+            } else {
+                None
+            },
+        });
+    }
+    if seen_count != families.len() {
+        if let Some(missing) = families
+            .iter()
+            .find_map(|(id, &(_, slot))| (!seen[slot as usize]).then_some(*id))
+        {
+            bail!("Missing metadata for reference member {missing}");
+        }
+    }
+    Ok(members)
+}
+
+fn members_text(result: Result<Vec<Member>>) -> String {
+    match result {
+        Ok(members) => members
+            .iter()
+            .map(|m| {
+                format!(
+                    "{} {} {} {} {} {} {} {:?}\n",
+                    m.id,
+                    m.sample,
+                    m.cluster,
+                    m.scaffold,
+                    m.annotation,
+                    m.dna,
+                    m.refound,
+                    m.location.map(|l| (l.start, l.end, l.strand))
+                )
+            })
+            .collect(),
+        Err(error) => format!("ERR {error:#}"),
+    }
+}
+
+#[test]
+fn chunked_read_members_matches_the_serial_loop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("gene_data.csv");
+    let path = path.to_str().unwrap();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |n: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % n
+    };
+    let ids: Vec<String> = (0..400).map(|i| format!("{}_{}_{}", i % 5, i / 5, i % 3)).collect();
+    for round in 0..300 {
+        let mut text = metadata_header().to_string();
+        let mut families = FxMap::default();
+        for (slot, id) in ids.iter().enumerate().filter(|(i, _)| i % 4 != 3) {
+            families.insert(id.as_str(), ((slot % 7) as u32, families.len() as u32));
+        }
+        for i in 0..400 {
+            let id = &ids[i];
+            match next(1000) {
+                // Rare faults, so many rounds succeed and the rest fail in
+                // different chunks.
+                0 if round % 3 == 0 => text.push_str(&format!("g,s,{id},a\n")),
+                1 if round % 3 == 0 => text.push_str(&format!("g,s,{},a,p,acgt,n,d\n", ids[next(400) as usize])),
+                2 if round % 3 == 1 => text.push_str(&format!("g,s,{id},a,p,,n,d\n")),
+                3 if round % 3 == 1 => text.push_str(&format!("g,s,9_{i}_x,a,p,acgt,n,d\n")),
+                4 => text.push_str("short,line\n"),
+                5 if round % 3 == 2 => text.push_str(&format!("g,s,{id}refound,a,p,acgt,n,location:bad\n")),
+                6 => text.push_str("\n"),
+                _ => text.push_str(&format!("g{i},s{i},{id},a{i},p,acgtn,n,d,extra\r\n")),
+            }
+        }
+        if round % 2 == 0 {
+            text.push_str(&format!("g,s,{},a,p,ACGT,n,d", ids[next(400) as usize]));
+        }
+        std::fs::write(path, &text).unwrap();
+        let expected = members_text(read_members_serial(path, &families, 5));
+        let actual = members_text(read_members(path, &families, 5));
+        assert_eq!(actual, expected, "round {round}");
+    }
+}
