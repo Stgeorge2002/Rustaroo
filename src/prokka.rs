@@ -31,11 +31,7 @@ pub fn translate(dna: &str, table: usize) -> String {
     let dna = dna.as_bytes();
     let mut protein = Vec::with_capacity(dna.len() / 3);
     for codon in dna.chunks_exact(3) {
-        protein.push(codon_amino([
-            codon[0].to_ascii_uppercase(),
-            codon[1].to_ascii_uppercase(),
-            codon[2].to_ascii_uppercase(),
-        ]));
+        protein.push(codon_amino_fast(codon[0], codon[1], codon[2]));
     }
     if table == 11
         && dna.len() >= 3
@@ -60,8 +56,50 @@ pub fn translate(dna: &str, table: usize) -> String {
     String::from_utf8(protein).expect("translation is ASCII")
 }
 
+/// 2-bit code of an (ASCII case-insensitive) A/C/G/T byte, 4 for anything else.
+const BASE_CODE: [u8; 256] = {
+    let mut table = [4u8; 256];
+    table[b'A' as usize] = 0;
+    table[b'C' as usize] = 1;
+    table[b'G' as usize] = 2;
+    table[b'T' as usize] = 3;
+    table[b'a' as usize] = 0;
+    table[b'c' as usize] = 1;
+    table[b'g' as usize] = 2;
+    table[b't' as usize] = 3;
+    table
+};
+
+/// `codon_amino` for all 64 A/C/G/T codons, generated from it at compile time.
+const CODON_TABLE: [u8; 64] = {
+    const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+    let mut table = [0u8; 64];
+    let mut index = 0;
+    while index < 64 {
+        table[index] = codon_amino([BASES[index >> 4], BASES[(index >> 2) & 3], BASES[index & 3]]);
+        index += 1;
+    }
+    table
+};
+
+/// Exactly `codon_amino` of the upper-cased bytes: every codon not made of
+/// A/C/G/T (any case) is 'X' there too.
+#[inline(always)]
+fn codon_amino_fast(first: u8, second: u8, third: u8) -> u8 {
+    let (a, b, c) = (
+        BASE_CODE[first as usize],
+        BASE_CODE[second as usize],
+        BASE_CODE[third as usize],
+    );
+    if (a | b | c) & 4 != 0 {
+        b'X'
+    } else {
+        CODON_TABLE[((a as usize) << 4) | ((b as usize) << 2) | c as usize]
+    }
+}
+
 #[inline]
-fn codon_amino(codon: [u8; 3]) -> u8 {
+const fn codon_amino(codon: [u8; 3]) -> u8 {
     match &codon {
         b"TTT" | b"TTC" => b'F',
         b"TTA" | b"TTG" | b"CTT" | b"CTC" | b"CTA" | b"CTG" => b'L',
@@ -207,15 +245,22 @@ pub fn get_gene_list(
     let content = std::fs::read_to_string(gff_file_name)
         .with_context(|| format!("Failed to read GFF file: {}", gff_file_name))?;
 
-    let content = content.replace(",", "");
-    let parts: Vec<&str> = content.split("##FASTA").collect();
-
-    if parts.len() != 2 {
+    // Same as `content.replace(",", "")`, without the copy when there is
+    // nothing to remove.
+    let content = if memchr::memchr(b',', content.as_bytes()).is_some() {
+        content.replace(",", "")
+    } else {
+        content
+    };
+    // Equivalent to splitting on "##FASTA" and requiring exactly two parts
+    // (the marker cannot overlap itself, so matches are the split points).
+    let mut markers = memchr::memmem::find_iter(content.as_bytes(), b"##FASTA");
+    let (Some(marker), None) = (markers.next(), markers.next()) else {
         anyhow::bail!("GFF file must have exactly one ##FASTA section");
-    }
+    };
 
-    let gff_section = parts[0];
-    let fasta_section = parts[1];
+    let gff_section = &content[..marker];
+    let fasta_section = &content[marker + "##FASTA".len()..];
 
     // Parse FASTA sequences
     let mut sequences = HashMap::new();
@@ -472,6 +517,25 @@ pub fn process_prokka_input(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codon_lookup_matches_match_table_for_every_byte_triple() {
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                for third in 0..=255u8 {
+                    assert_eq!(
+                        super::codon_amino_fast(first, second, third),
+                        super::codon_amino([
+                            first.to_ascii_uppercase(),
+                            second.to_ascii_uppercase(),
+                            third.to_ascii_uppercase(),
+                        ]),
+                        "{first} {second} {third}"
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
