@@ -993,7 +993,9 @@ fn build_search_list<'a, S: BuildHasher>(
     // are recorded at that first visit; later visits only add searches.
     // `conflicts` is a set, so inserting once instead of once per adjacent
     // node yields the same contents.
-    let mut resolved: Vec<Option<Vec<(usize, &'a str)>>> = vec![None; graph.node_count()];
+    // The graph is a StableGraph, so indices can exceed node_count().
+    let mut resolved: Vec<Option<Vec<(usize, &'a str)>>> =
+        vec![None; petgraph::visit::NodeIndexable::node_bound(graph)];
 
     for node_idx in graph.node_indices() {
         let node = &graph[node_idx];
@@ -1759,6 +1761,11 @@ mod tests {
     #[test]
     fn search_list_deduplicates_same_family_and_genome() -> Result<()> {
         let mut graph = Graph::default();
+        // Leave holes so node indices exceed node_count(), as after cleaning.
+        let holes = [
+            graph.add_node(GeneNode::default()),
+            graph.add_node(GeneNode::default()),
+        ];
         let missing = graph.add_node(GeneNode {
             dna: vec!["ATGAAATAG".into()],
             ..Default::default()
@@ -1776,6 +1783,10 @@ mod tests {
                 ..GeneEdge::default()
             },
         );
+        for hole in holes {
+            graph.remove_node(hole);
+        }
+        assert!(neighbor.index() >= graph.node_count());
         let ids = HashMap::from([
             ("0_0_1".into(), "first".into()),
             ("0_0_2".into(), "second".into()),
