@@ -19,13 +19,14 @@ use self::fxhash::{HashMap as FxMap, HashSet as FxSet};
 use self::genetic_code::{is_intact, translate, uppercase_dna};
 use self::model::{Call, Pools};
 use self::reference::{choose_reference, Allele, Choice, OtherGenes};
+use crate::line_reader::LineReader;
 use crate::network::{GeneEdge, GeneNode, Graph};
 use anyhow::{bail, Context, Result};
 use petgraph::graph::NodeIndex;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
 struct Member {
@@ -46,11 +47,16 @@ struct Location {
     strand: i8,
 }
 
+// The maps below are only ever queried, never iterated, so their hasher
+// cannot affect any output (see `fxhash`).
 struct SampleLocations {
-    contigs: HashMap<String, u32>,
+    contigs: FxMap<String, u32>,
     lengths: Vec<usize>,
-    annotations: HashMap<(String, String), Location>,
+    annotations: FxMap<(String, String), Location>,
 }
+
+/// Annotations needed from one sample: scaffold -> annotation IDs.
+type NeededAnnotations = FxMap<String, FxSet<String>>;
 
 struct Selected {
     choice: Choice,
@@ -70,7 +76,9 @@ pub fn generate_pan_genome_reference(
     output_dir: &str,
 ) -> Result<()> {
     let nodes: Vec<_> = graph.node_indices().collect();
-    let mut families = HashMap::new();
+    // Sequence ID -> (family, slot). Slots let `read_members` track which IDs
+    // it has seen without a second string set.
+    let mut families = FxMap::default();
     let mut names = HashSet::new();
     for (cluster, &node) in nodes.iter().enumerate() {
         let name = family_names
@@ -84,17 +92,29 @@ pub fn generate_pan_genome_reference(
             bail!("Family {name} has no member sequences for reference selection");
         }
         for id in &graph[node].seq_ids {
-            if families.insert(id.clone(), cluster).is_some() {
+            let slot = u32::try_from(families.len()).context("Too many reference members")?;
+            if families.insert(id.as_str(), (cluster, slot)).is_some() {
                 bail!("Sequence {id} belongs to more than one final family");
             }
         }
     }
 
     let mut members = read_members(gene_data_file, &families, input_files.len())?;
-    let mut needed = vec![HashSet::new(); input_files.len()];
+    let mut needed = vec![NeededAnnotations::default(); input_files.len()];
     for member in &members {
         if !member.refound {
-            needed[member.sample].insert((member.scaffold.clone(), member.annotation.clone()));
+            let scaffolds = &mut needed[member.sample];
+            match scaffolds.get_mut(member.scaffold.as_str()) {
+                Some(annotations) => {
+                    annotations.insert(member.annotation.clone());
+                }
+                None => {
+                    scaffolds.insert(
+                        member.scaffold.clone(),
+                        FxSet::from_iter([member.annotation.clone()]),
+                    );
+                }
+            }
         }
     }
     let locations: Vec<_> = input_files
@@ -107,13 +127,14 @@ pub fn generate_pan_genome_reference(
         .map(|sample| sample.lengths.clone())
         .collect();
     let mut pools = Pools::default();
-    let mut dna_ids = HashMap::new();
-    let mut protein_ids = HashMap::new();
+    // Interning maps: IDs are assigned in member order, never by map order.
+    let mut dna_ids = FxMap::<String, usize>::default();
+    let mut protein_ids = FxMap::default();
     let mut dna_proteins = Vec::new();
     let mut calls = Vec::with_capacity(members.len());
     // Rustaroo's physical-locus tests require genomic order, not HashSet order.
     members.sort_by(|a, b| a.id.cmp(&b.id));
-    for member in &members {
+    for member in members {
         let sample = &locations[member.sample];
         let contig = *sample.contigs.get(&member.scaffold).with_context(|| {
             format!(
@@ -125,7 +146,7 @@ pub fn generate_pan_genome_reference(
             Some(location) => location,
             None => *sample
                 .annotations
-                .get(&(member.scaffold.clone(), member.annotation.clone()))
+                .get(&(member.scaffold, member.annotation))
                 .with_context(|| format!("Missing GFF location for member {}", member.id))?,
         };
         if location.start == 0
@@ -134,11 +155,15 @@ pub fn generate_pan_genome_reference(
         {
             bail!("Out-of-range reference evidence for member {}", member.id);
         }
-        let dna = *dna_ids.entry(member.dna.clone()).or_insert_with(|| {
-            let id = pools.dna.len();
-            pools.dna.push(member.dna.clone());
-            id
-        });
+        let dna = match dna_ids.get(member.dna.as_str()) {
+            Some(&id) => id,
+            None => {
+                let id = pools.dna.len();
+                pools.dna.push(member.dna.clone());
+                dna_ids.insert(member.dna.clone(), id);
+                id
+            }
+        };
         let protein = if dna < dna_proteins.len() {
             dna_proteins[dna]
         } else {
@@ -152,7 +177,7 @@ pub fn generate_pan_genome_reference(
             protein
         };
         calls.push((
-            member.id.clone(),
+            member.id,
             Call {
                 sample: u32::try_from(member.sample)?,
                 contig,
@@ -169,7 +194,6 @@ pub fn generate_pan_genome_reference(
     }
     calls.sort_by_key(|(_, call)| (call.sample, call.contig, call.start, call.end));
     let (member_ids, calls): (Vec<_>, Vec<_>) = calls.into_iter().unzip();
-    drop(members);
     drop(dna_ids);
     drop(protein_ids);
     let mut groups = FxMap::<u32, Vec<usize>>::default();
@@ -331,31 +355,44 @@ fn select(
 
 fn read_members(
     path: &str,
-    families: &HashMap<String, u32>,
+    families: &FxMap<&str, (u32, u32)>,
     sample_count: usize,
 ) -> Result<Vec<Member>> {
     let mut members = Vec::with_capacity(families.len());
-    let mut seen = HashSet::new();
-    let mut lines = BufReader::new(File::open(path)?).lines();
-    let header = lines.next().context("Empty reference metadata")??;
+    let mut seen = vec![false; families.len()];
+    let mut seen_count = 0usize;
+    let mut lines = LineReader::open(path)?;
+    let header = lines.next_line().context("Empty reference metadata")??;
     if !header.starts_with(
         "gff_file,scaffold_name,clustering_id,annotation_id,prot_sequence,dna_sequence,",
     ) {
         bail!("Reference selection requires the eight-column gene_data.csv schema");
     }
-    for (line_number, line) in lines.enumerate() {
+    let mut line_number = 0usize;
+    while let Some(line) = lines.next_line() {
         let line = line?;
-        let fields: Vec<_> = line.splitn(8, ',').collect();
-        let Some(&cluster) = fields.get(2).and_then(|id| families.get(*id)) else {
+        let mut fields = [""; 8];
+        let mut count = 0;
+        for field in line.splitn(8, ',') {
+            fields[count] = field;
+            count += 1;
+        }
+        let current_line = line_number;
+        line_number += 1;
+        if count < 3 {
+            continue;
+        }
+        let Some(&(cluster, slot)) = families.get(fields[2]) else {
             continue;
         };
-        if fields.len() != 8 {
-            bail!("Invalid reference metadata at {}:{}", path, line_number + 2);
+        if count != 8 {
+            bail!("Invalid reference metadata at {}:{}", path, current_line + 2);
         }
         let id = fields[2];
-        if !seen.insert(id.to_string()) {
+        if std::mem::replace(&mut seen[slot as usize], true) {
             bail!("Duplicate reference member ID {id}");
         }
+        seen_count += 1;
         let sample: usize = id
             .split('_')
             .next()
@@ -385,8 +422,13 @@ fn read_members(
             },
         });
     }
-    if let Some(missing) = families.keys().find(|id| !seen.contains(*id)) {
-        bail!("Missing metadata for reference member {missing}");
+    if seen_count != families.len() {
+        if let Some(missing) = families
+            .iter()
+            .find_map(|(id, &(_, slot))| (!seen[slot as usize]).then_some(*id))
+        {
+            bail!("Missing metadata for reference member {missing}");
+        }
     }
     Ok(members)
 }
@@ -421,15 +463,18 @@ fn refound_location(description: &str, id: &str) -> Result<Location> {
     })
 }
 
-fn read_locations(path: &str, needed: &HashSet<(String, String)>) -> Result<SampleLocations> {
-    let mut contigs = HashMap::new();
+fn read_locations(path: &str, needed: &NeededAnnotations) -> Result<SampleLocations> {
+    let mut contigs = FxMap::default();
     let mut lengths = Vec::<usize>::new();
-    let mut annotations = HashMap::new();
+    let mut annotations = FxMap::default();
     let mut fasta = false;
     let mut current = None;
-    for (number, line) in BufReader::new(File::open(path)?).lines().enumerate() {
-        let line = line?;
-        let line = line.trim();
+    let mut lines = LineReader::open(path)?;
+    let mut number = 0usize;
+    while let Some(line) = lines.next_line() {
+        let line = line?.trim();
+        let current_number = number;
+        number += 1;
         if line == "##FASTA" {
             if fasta {
                 bail!("Multiple FASTA sections in reference input {path}");
@@ -443,9 +488,19 @@ fn read_locations(path: &str, needed: &HashSet<(String, String)>) -> Result<Samp
             }
             // Match the existing Rustaroo parser's removal of commas, but never
             // use this evidence parser to change accepted CDS or their sequence.
-            let line = line.replace(',', "");
-            let fields: Vec<_> = line.split('\t').collect();
-            if fields.len() < 9 || fields[2] != "CDS" {
+            let line: std::borrow::Cow<str> = if line.contains(',') {
+                line.replace(',', "").into()
+            } else {
+                line.into()
+            };
+            // The first nine tab-separated fields, as a full split would give.
+            let mut fields = [""; 9];
+            let mut count = 0;
+            for field in line.split('\t').take(9) {
+                fields[count] = field;
+                count += 1;
+            }
+            if count < 9 || fields[2] != "CDS" {
                 continue;
             }
             let Some(id) = fields[8]
@@ -454,10 +509,14 @@ fn read_locations(path: &str, needed: &HashSet<(String, String)>) -> Result<Samp
             else {
                 continue;
             };
-            let key = (fields[0].to_string(), id.to_string());
-            if !needed.contains(&key) {
+            if !needed
+                .get(fields[0])
+                .is_some_and(|annotations| annotations.contains(id))
+            {
                 continue;
             }
+            let key = (fields[0].to_string(), id.to_string());
+            let number = current_number;
             let location = Location {
                 start: fields[3]
                     .parse()

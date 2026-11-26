@@ -17,6 +17,7 @@ pub mod family_index;
 pub mod filter_pa;
 pub mod find_missing;
 pub mod integrate;
+pub(crate) mod line_reader;
 pub mod merge_graphs;
 pub mod merge_nodes;
 pub mod neighborhood;

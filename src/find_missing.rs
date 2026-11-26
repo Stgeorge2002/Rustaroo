@@ -1,6 +1,7 @@
 //! Missing-gene sequence search in neighboring annotation windows.
 
 use crate::alignment::{RefindAlignment, RefindMatcher, RefindScratch};
+use crate::line_reader::LineReader;
 use crate::network::Graph;
 use crate::network::{GeneEdge, GeneNode};
 use crate::prokka::{reverse_complement, translate};
@@ -13,9 +14,8 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs::File;
 use std::hash::BuildHasher;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -909,44 +909,9 @@ fn pad_target(padded: &mut String, target: &str, padding: usize) {
 /// affect any output (the original's `RandomState` order was random anyway).
 pub type AnnotationIds = crate::reference::fxhash::HashMap<String, String>;
 
-/// Line reader equivalent to `BufRead::lines` (same terminator handling and
-/// UTF-8 errors) that reuses one buffer instead of allocating per line.
-struct MetadataLines {
-    reader: BufReader<File>,
-    buffer: Vec<u8>,
-}
-
-impl MetadataLines {
-    fn open(path: &str) -> std::io::Result<Self> {
-        Ok(Self {
-            reader: BufReader::with_capacity(1 << 20, File::open(path)?),
-            buffer: Vec::new(),
-        })
-    }
-
-    fn next_line(&mut self) -> Option<std::io::Result<&str>> {
-        self.buffer.clear();
-        match self.reader.read_until(b'\n', &mut self.buffer) {
-            Ok(0) => return None,
-            Ok(_) => {}
-            Err(error) => return Some(Err(error)),
-        }
-        let mut line = &self.buffer[..];
-        if let Some(rest) = line.strip_suffix(b"\n") {
-            line = rest.strip_suffix(b"\r").unwrap_or(rest);
-        }
-        Some(std::str::from_utf8(line).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8",
-            )
-        }))
-    }
-}
-
 /// Map clustering identifiers to original annotation identifiers.
 pub fn load_annotation_ids(gene_data_file: &str) -> Result<AnnotationIds> {
-    let mut lines = MetadataLines::open(gene_data_file)?;
+    let mut lines = LineReader::open(gene_data_file)?;
     let mut id_to_gff = AnnotationIds::default();
 
     let mut i = 0usize;
@@ -1079,7 +1044,7 @@ fn load_merged_sequences(
     }
     let mut sequences = HashMap::new();
     let mut found = HashSet::new();
-    let mut lines = MetadataLines::open(gene_data_file)?;
+    let mut lines = LineReader::open(gene_data_file)?;
     let mut line_number = 0usize;
     while let Some(line) = lines.next_line() {
         line_number += 1;
@@ -1311,34 +1276,6 @@ mod tests {
             .all(|matcher| Arc::ptr_eq(&matchers[0], matcher)));
         assert_eq!(cache.matchers.len(), 1);
         assert!(cache.get("").is_none());
-    }
-
-    #[test]
-    fn metadata_lines_match_bufread_lines() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        for content in [
-            &b""[..],
-            b"\n",
-            b"a\r\nb\nc",
-            b"x\r\r\n\ry\r",
-            b"h,e\n\n,,id,ann\r\nlast,line,id2,ann2",
-            b"ok\n\xff\xfe\nafter\n",
-        ] {
-            let path = dir.path().join("lines.txt");
-            std::fs::write(&path, content)?;
-            let path = path.to_str().unwrap();
-            let expected: Vec<_> = BufReader::new(File::open(path)?)
-                .lines()
-                .map(|line| line.map_err(|error| error.kind()))
-                .collect();
-            let mut lines = MetadataLines::open(path)?;
-            let mut actual = Vec::new();
-            while let Some(line) = lines.next_line() {
-                actual.push(line.map(str::to_owned).map_err(|error| error.kind()));
-            }
-            assert_eq!(actual, expected);
-        }
-        Ok(())
     }
 
     #[test]
