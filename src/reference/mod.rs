@@ -6,7 +6,7 @@
 
 mod align;
 mod evidence;
-mod fxhash;
+pub(crate) mod fxhash;
 mod genetic_code;
 mod model;
 mod reference;

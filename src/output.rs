@@ -18,7 +18,7 @@ pub use crate::reference::generate_pan_genome_reference;
 pub fn generate_roary_gene_presence_absence(
     graph: &Graph<GeneNode, GeneEdge>,
     mems_to_isolates: &HashMap<usize, String>,
-    orig_ids: &HashMap<String, String>,
+    orig_ids: &HashMap<String, String, impl std::hash::BuildHasher>,
     output_dir: &str,
 ) -> Result<HashMap<NodeIndex, String>> {
     let mut members: Vec<_> = mems_to_isolates.iter().collect();

@@ -903,26 +903,72 @@ fn pad_target(padded: &mut String, target: &str, padding: usize) {
     padded.extend(std::iter::repeat('E').take(padding));
 }
 
-/// Map clustering identifiers to original annotation identifiers.
-pub fn load_annotation_ids(gene_data_file: &str) -> Result<HashMap<String, String>> {
-    let file = File::open(gene_data_file)?;
-    let reader = BufReader::new(file);
-    let mut id_to_gff = HashMap::new();
+/// Clustering identifier -> original annotation identifier.
+///
+/// Only ever queried with `get`, never iterated, so the fixed hasher cannot
+/// affect any output (the original's `RandomState` order was random anyway).
+pub type AnnotationIds = crate::reference::fxhash::HashMap<String, String>;
 
-    for (i, line) in reader.lines().enumerate() {
+/// Line reader equivalent to `BufRead::lines` (same terminator handling and
+/// UTF-8 errors) that reuses one buffer instead of allocating per line.
+struct MetadataLines {
+    reader: BufReader<File>,
+    buffer: Vec<u8>,
+}
+
+impl MetadataLines {
+    fn open(path: &str) -> std::io::Result<Self> {
+        Ok(Self {
+            reader: BufReader::with_capacity(1 << 20, File::open(path)?),
+            buffer: Vec::new(),
+        })
+    }
+
+    fn next_line(&mut self) -> Option<std::io::Result<&str>> {
+        self.buffer.clear();
+        match self.reader.read_until(b'\n', &mut self.buffer) {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(error) => return Some(Err(error)),
+        }
+        let mut line = &self.buffer[..];
+        if let Some(rest) = line.strip_suffix(b"\n") {
+            line = rest.strip_suffix(b"\r").unwrap_or(rest);
+        }
+        Some(std::str::from_utf8(line).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        }))
+    }
+}
+
+/// Map clustering identifiers to original annotation identifiers.
+pub fn load_annotation_ids(gene_data_file: &str) -> Result<AnnotationIds> {
+    let mut lines = MetadataLines::open(gene_data_file)?;
+    let mut id_to_gff = AnnotationIds::default();
+
+    let mut i = 0usize;
+    while let Some(line) = lines.next_line() {
         if i == 0 {
+            // Like the original `enumerate` loop, the header is skipped
+            // before its read result is inspected.
+            i += 1;
             continue;
         }
         let line = line?;
-        let fields: Vec<&str> = line.splitn(5, ',').collect();
-        let id = fields.get(2).filter(|id| !id.is_empty()).with_context(|| {
+        // Fields 2 and 3 of `splitn(5, ',')` are exactly the third and fourth
+        // pieces of a plain split.
+        let mut fields = line.split(',');
+        let id = fields.nth(2).filter(|id| !id.is_empty()).with_context(|| {
             format!(
                 "Missing clustering ID in {} at line {}",
                 gene_data_file,
                 i + 1
             )
         })?;
-        let annotation = fields.get(3).filter(|id| !id.is_empty()).with_context(|| {
+        let annotation = fields.next().filter(|id| !id.is_empty()).with_context(|| {
             format!(
                 "Missing annotation ID in {} at line {}",
                 gene_data_file,
@@ -930,17 +976,24 @@ pub fn load_annotation_ids(gene_data_file: &str) -> Result<HashMap<String, Strin
             )
         })?;
         id_to_gff.insert(id.to_string(), annotation.to_string());
+        i += 1;
     }
 
     Ok(id_to_gff)
 }
 
-fn build_search_list<'a>(
+fn build_search_list<'a, S: BuildHasher>(
     graph: &'a Graph<GeneNode, GeneEdge>,
-    id_to_gff: &'a HashMap<String, String>,
+    id_to_gff: &'a HashMap<String, String, S>,
 ) -> Result<HashMap<usize, GenomeSearch<'a>>> {
     let mut search_list: HashMap<usize, GenomeSearch<'a>> = HashMap::new();
     let mut seen = HashMap::new();
+    // Each neighbour's (member, annotation id) list is resolved once, in the
+    // neighbour's own `seq_ids` iteration order, and its conflict locations
+    // are recorded at that first visit; later visits only add searches.
+    // `conflicts` is a set, so inserting once instead of once per adjacent
+    // node yields the same contents.
+    let mut resolved: Vec<Option<Vec<(usize, &'a str)>>> = vec![None; graph.node_count()];
 
     for node_idx in graph.node_indices() {
         let node = &graph[node_idx];
@@ -960,21 +1013,32 @@ fn build_search_list<'a>(
         }
 
         for neighbor_idx in graph.neighbors(node_idx) {
-            let neighbor = &graph[neighbor_idx];
+            let slot = &mut resolved[neighbor_idx.index()];
+            if slot.is_none() {
+                let neighbor = &graph[neighbor_idx];
+                let mut ids = Vec::with_capacity(neighbor.seq_ids.len());
+                for seq_id in &neighbor.seq_ids {
+                    let member = seq_id
+                        .split('_')
+                        .next()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .with_context(|| format!("Invalid genome ID in sequence {}", seq_id))?;
+                    let gff_id = id_to_gff.get(seq_id).with_context(|| {
+                        format!("Missing original annotation ID for {}", seq_id)
+                    })?;
+                    search_list
+                        .entry(member)
+                        .or_default()
+                        .conflicts
+                        .insert((neighbor_idx, gff_id.as_str()));
+                    ids.push((member, gff_id.as_str()));
+                }
+                *slot = Some(ids);
+            }
 
-            for seq_id in &neighbor.seq_ids {
-                let member = seq_id
-                    .split('_')
-                    .next()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .with_context(|| format!("Invalid genome ID in sequence {}", seq_id))?;
-
-                let gff_id = id_to_gff
-                    .get(seq_id)
-                    .with_context(|| format!("Missing original annotation ID for {}", seq_id))?;
-                let genome = search_list.entry(member).or_default();
-                genome.conflicts.insert((neighbor_idx, gff_id.as_str()));
+            for &(member, gff_id) in slot.as_ref().unwrap() {
                 if !node.members.contains(&member) {
+                    let genome = search_list.entry(member).or_default();
                     let searches = &mut genome.searches;
                     let position = *seen.entry((node_idx, member)).or_insert_with(|| {
                         let position = searches.len();
@@ -985,7 +1049,7 @@ fn build_search_list<'a>(
                         });
                         position
                     });
-                    searches[position].anchors.insert(gff_id.as_str());
+                    searches[position].anchors.insert(gff_id);
                 }
             }
         }
@@ -1013,10 +1077,11 @@ fn load_merged_sequences(
     }
     let mut sequences = HashMap::new();
     let mut found = HashSet::new();
-    for (line_number, line) in BufReader::new(File::open(gene_data_file)?)
-        .lines()
-        .enumerate()
-    {
+    let mut lines = MetadataLines::open(gene_data_file)?;
+    let mut line_number = 0usize;
+    while let Some(line) = lines.next_line() {
+        line_number += 1;
+        let line_number = line_number - 1;
         if line_number == 0 {
             continue;
         }
@@ -1244,6 +1309,34 @@ mod tests {
             .all(|matcher| Arc::ptr_eq(&matchers[0], matcher)));
         assert_eq!(cache.matchers.len(), 1);
         assert!(cache.get("").is_none());
+    }
+
+    #[test]
+    fn metadata_lines_match_bufread_lines() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for content in [
+            &b""[..],
+            b"\n",
+            b"a\r\nb\nc",
+            b"x\r\r\n\ry\r",
+            b"h,e\n\n,,id,ann\r\nlast,line,id2,ann2",
+            b"ok\n\xff\xfe\nafter\n",
+        ] {
+            let path = dir.path().join("lines.txt");
+            std::fs::write(&path, content)?;
+            let path = path.to_str().unwrap();
+            let expected: Vec<_> = BufReader::new(File::open(path)?)
+                .lines()
+                .map(|line| line.map_err(|error| error.kind()))
+                .collect();
+            let mut lines = MetadataLines::open(path)?;
+            let mut actual = Vec::new();
+            while let Some(line) = lines.next_line() {
+                actual.push(line.map(str::to_owned).map_err(|error| error.kind()));
+            }
+            assert_eq!(actual, expected);
+        }
+        Ok(())
     }
 
     #[test]
