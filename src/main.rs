@@ -156,6 +156,10 @@ struct Args {
     /// Keep temporary files
     #[arg(long)]
     keep_temp: bool,
+
+    /// Write mutation_codes.tsv: MutCode edits of every member against its family reference
+    #[arg(long)]
+    mut_code: bool,
 }
 
 struct RunLog {
@@ -289,7 +293,11 @@ fn run(args: &Args) -> Result<()> {
         .build()?;
     pool.install(|| run_rustaroo_pipeline(&rustaroo_args, args, work_path))?;
     if let Some(work_dir) = work_dir {
-        for name in ["pan_genome_reference.fa", "gene_presence_absence.csv"] {
+        let mut names = vec!["pan_genome_reference.fa", "gene_presence_absence.csv"];
+        if args.mut_code {
+            names.push("mutation_codes.tsv");
+        }
+        for name in names {
             let destination = args.out_dir.join(name);
             std::fs::rename(work_dir.path().join(name), &destination)
                 .with_context(|| format!("Publishing {}", destination.display()))?;
@@ -650,6 +658,7 @@ fn run_rustaroo_pipeline(
             &rustaroo_args.input_files,
             &family_names,
             &outdir,
+            args.mut_code,
         )?;
         Ok(stage_started.elapsed())
     };
@@ -675,9 +684,7 @@ fn run_rustaroo_pipeline(
         let (reference_elapsed, graph_elapsed) = rayon::join(reference, graph_files);
         timings.push(("Reference generation", reference_elapsed?));
         timings.push(("Graph and summary output", graph_elapsed?));
-        log::info!(
-            "Generated presence/absence matrix, reference, graph, and structural variants"
-        );
+        log::info!("Generated presence/absence matrix, reference, graph, and structural variants");
     }
     log::info!(
         "Output generation completed in {:.3}s",
@@ -782,8 +789,19 @@ mod tests {
     #[test]
     fn csv_body_copy_matches_line_loop() {
         for content in [
-            "", "h", "h\n", "h\n\n", "h\na", "h\na\n", "h\na\nb", "h\na\n\nb\n\n",
-            "h\r\na\r\n", "h\na\rb\n", "h\na\r", "\n\n\n", "\na",
+            "",
+            "h",
+            "h\n",
+            "h\n\n",
+            "h\na",
+            "h\na\n",
+            "h\na\nb",
+            "h\na\n\nb\n\n",
+            "h\r\na\r\n",
+            "h\na\rb\n",
+            "h\na\r",
+            "\n\n\n",
+            "\na",
         ] {
             let mut expected = Vec::new();
             for (j, line) in content.lines().enumerate() {

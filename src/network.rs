@@ -146,10 +146,7 @@ pub fn generate_network_with_ids(
     // Determine paralogs
     let mut paralogs = HashSet::new();
     for (cluster, members) in &cluster_members {
-        let genomes: Vec<&str> = members
-            .iter()
-            .map(|s| genome_prefix(s))
-            .collect();
+        let genomes: Vec<&str> = members.iter().map(|s| genome_prefix(s)).collect();
         let unique_genomes: HashSet<_> = genomes.into_iter().collect();
         if members.len() != unique_genomes.len() {
             paralogs.insert(*cluster);
@@ -248,58 +245,57 @@ fn load_cluster_data(
     if let Some(standard_schema) = standard_schema {
         let body_start = lines.position();
         drop(lines);
-        let ranges = crate::line_reader::line_chunks(
-            data_file,
-            body_start,
-            rayon::current_num_threads(),
-        )?;
+        let ranges =
+            crate::line_reader::line_chunks(data_file, body_start, rayon::current_num_threads())?;
         let chunks: Vec<_> = ranges
             .into_par_iter()
-            .map(|(start, end)| -> (Vec<(usize, ClusterData)>, Option<std::io::Error>) {
-                let mut found = Vec::new();
-                let mut lines = match LineReader::open_range(data_file, start, end) {
-                    Ok(lines) => lines,
-                    Err(error) => return (found, Some(error)),
-                };
-                while let Some(line) = lines.next_line() {
-                    let line = match line {
-                        Ok(line) => line,
+            .map(
+                |(start, end)| -> (Vec<(usize, ClusterData)>, Option<std::io::Error>) {
+                    let mut found = Vec::new();
+                    let mut lines = match LineReader::open_range(data_file, start, end) {
+                        Ok(lines) => lines,
                         Err(error) => return (found, Some(error)),
                     };
-                    // Only the first eight fields are read; "at least seven
-                    // fields" is the same test on the first eight.
-                    let mut fields = [""; 8];
-                    let mut count = 0;
-                    for field in line.split(',').take(8) {
-                        fields[count] = field;
-                        count += 1;
-                    }
-                    let fields = &fields[..count];
-                    if fields.len() >= 7 {
-                        let seq_id = fields[2];
-                        if centroid_ids.contains(seq_id) {
-                            if let Some(&cluster) = seq_to_cluster.get(seq_id) {
-                                found.push((
-                                    cluster,
-                                    ClusterData {
-                                        prot_sequence: fields[4].to_string(),
-                                        dna_sequence: fields
-                                            [if standard_schema { 5 } else { 3 }]
-                                        .to_string(),
-                                        annotation: fields[6].to_string(),
-                                        description: if standard_schema {
-                                            fields.get(7).unwrap_or(&"").to_string()
-                                        } else {
-                                            fields[5].to_string()
+                    while let Some(line) = lines.next_line() {
+                        let line = match line {
+                            Ok(line) => line,
+                            Err(error) => return (found, Some(error)),
+                        };
+                        // Only the first eight fields are read; "at least seven
+                        // fields" is the same test on the first eight.
+                        let mut fields = [""; 8];
+                        let mut count = 0;
+                        for field in line.split(',').take(8) {
+                            fields[count] = field;
+                            count += 1;
+                        }
+                        let fields = &fields[..count];
+                        if fields.len() >= 7 {
+                            let seq_id = fields[2];
+                            if centroid_ids.contains(seq_id) {
+                                if let Some(&cluster) = seq_to_cluster.get(seq_id) {
+                                    found.push((
+                                        cluster,
+                                        ClusterData {
+                                            prot_sequence: fields[4].to_string(),
+                                            dna_sequence: fields
+                                                [if standard_schema { 5 } else { 3 }]
+                                            .to_string(),
+                                            annotation: fields[6].to_string(),
+                                            description: if standard_schema {
+                                                fields.get(7).unwrap_or(&"").to_string()
+                                            } else {
+                                                fields[5].to_string()
+                                            },
                                         },
-                                    },
-                                ));
+                                    ));
+                                }
                             }
                         }
                     }
-                }
-                (found, None)
-            })
+                    (found, None)
+                },
+            )
             .collect();
         for (found, error) in chunks {
             for (cluster, data) in found {

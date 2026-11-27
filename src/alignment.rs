@@ -79,7 +79,10 @@ impl GlobalPattern {
         let boundaries: Vec<u64> = (0..block_count)
             .map(|block| 1u64 << ((length - block * 64).min(64) - 1))
             .collect();
-        let shifts = boundaries.iter().map(|boundary| boundary.trailing_zeros()).collect();
+        let shifts = boundaries
+            .iter()
+            .map(|boundary| boundary.trailing_zeros())
+            .collect();
         Self {
             slots,
             masks,
@@ -117,7 +120,13 @@ impl GlobalPattern {
     /// `advance` restricted to blocks `low..high`, with the top boundary of
     /// block `low` increasing by one per column; returns the distance of the
     /// last processed block.
-    fn advance_range(&self, states: &mut [GlobalState], base: u8, low: usize, high: usize) -> usize {
+    fn advance_range(
+        &self,
+        states: &mut [GlobalState],
+        base: u8,
+        low: usize,
+        high: usize,
+    ) -> usize {
         let block_count = self.boundaries.len();
         let start = usize::from(self.slots[usize::from(base)]) * block_count;
         let masks = &self.masks[start + low..start + high];
@@ -1080,7 +1089,11 @@ mod tests {
             let flank = [0, 3, length / 3, length][case % 4];
             let mut target = random_sequence(flank, b"ACGT", &mut seed);
             target.extend(&copy);
-            target.extend(random_sequence([length, 0, 7][case % 3], b"ACGT", &mut seed));
+            target.extend(random_sequence(
+                [length, 0, 7][case % 3],
+                b"ACGT",
+                &mut seed,
+            ));
             if case % 5 == 0 {
                 target.extend(&copy);
             }

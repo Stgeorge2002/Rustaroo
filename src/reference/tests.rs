@@ -428,15 +428,35 @@ fn preloaded_reference_reports_family_errors_in_original_order() {
     // (families, names); None = missing name. Expected first error message.
     let cases: Vec<(Vec<Vec<&str>>, Vec<Option<&str>>, &str)> = vec![
         // Duplicate member in node 1 precedes a bad name in node 2.
-        (vec![vec!["a"], vec!["a"], vec!["b"]], vec![Some("x"), Some("y"), Some("bad name")], "Sequence a belongs to more than one final family"),
+        (
+            vec![vec!["a"], vec!["a"], vec!["b"]],
+            vec![Some("x"), Some("y"), Some("bad name")],
+            "Sequence a belongs to more than one final family",
+        ),
         // A bad name in node 1 precedes node 1's own structural error.
-        (vec![vec!["a"], vec![], vec!["b"]], vec![Some("x"), Some("x"), Some("z")], "unique, nonempty family identifier"),
+        (
+            vec![vec!["a"], vec![], vec!["b"]],
+            vec![Some("x"), Some("x"), Some("z")],
+            "unique, nonempty family identifier",
+        ),
         // An empty family's message carries its name.
-        (vec![vec!["a"], vec![], vec!["b"]], vec![Some("x"), Some("y"), None], "Family y has no member sequences"),
+        (
+            vec![vec!["a"], vec![], vec!["b"]],
+            vec![Some("x"), Some("y"), None],
+            "Family y has no member sequences",
+        ),
         // A missing name before the structural error.
-        (vec![vec!["a"], vec!["b"], vec!["b"]], vec![Some("x"), None, Some("z")], "Missing output family name"),
+        (
+            vec![vec!["a"], vec!["b"], vec!["b"]],
+            vec![Some("x"), None, Some("z")],
+            "Missing output family name",
+        ),
         // No structural error: name errors anywhere are still found.
-        (vec![vec!["a"], vec!["b"]], vec![Some("x"), Some("")], "unique, nonempty family identifier"),
+        (
+            vec![vec!["a"], vec!["b"]],
+            vec![Some("x"), Some("")],
+            "unique, nonempty family identifier",
+        ),
     ];
     for (families, names, expected) in cases {
         let mut graph = Graph::<GeneNode, GeneEdge>::default();
@@ -448,10 +468,14 @@ fn preloaded_reference_reports_family_errors_in_original_order() {
             }
         }
         let preload = preload_reference(&graph, data.to_str().unwrap(), 0);
-        let error = generate_pan_genome_reference_with(preload, &graph, &[], &family_names, &out)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains(expected), "{error:?} should contain {expected:?}");
+        let error =
+            generate_pan_genome_reference_with(preload, &graph, &[], &family_names, &out, false)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains(expected),
+            "{error:?} should contain {expected:?}"
+        );
     }
 }
 
@@ -489,7 +513,11 @@ fn read_members_serial(
             continue;
         };
         if count != 8 {
-            bail!("Invalid reference metadata at {}:{}", path, current_line + 2);
+            bail!(
+                "Invalid reference metadata at {}:{}",
+                path,
+                current_line + 2
+            );
         }
         let id = fields[2];
         if std::mem::replace(&mut seen[slot as usize], true) {
@@ -570,7 +598,9 @@ fn chunked_read_members_matches_the_serial_loop() {
         state ^= state << 17;
         state % n
     };
-    let ids: Vec<String> = (0..400).map(|i| format!("{}_{}_{}", i % 5, i / 5, i % 3)).collect();
+    let ids: Vec<String> = (0..400)
+        .map(|i| format!("{}_{}_{}", i % 5, i / 5, i % 3))
+        .collect();
     for round in 0..300 {
         let mut text = metadata_header().to_string();
         let mut families = FxMap::default();
@@ -583,11 +613,15 @@ fn chunked_read_members_matches_the_serial_loop() {
                 // Rare faults, so many rounds succeed and the rest fail in
                 // different chunks.
                 0 if round % 3 == 0 => text.push_str(&format!("g,s,{id},a\n")),
-                1 if round % 3 == 0 => text.push_str(&format!("g,s,{},a,p,acgt,n,d\n", ids[next(400) as usize])),
+                1 if round % 3 == 0 => {
+                    text.push_str(&format!("g,s,{},a,p,acgt,n,d\n", ids[next(400) as usize]))
+                }
                 2 if round % 3 == 1 => text.push_str(&format!("g,s,{id},a,p,,n,d\n")),
                 3 if round % 3 == 1 => text.push_str(&format!("g,s,9_{i}_x,a,p,acgt,n,d\n")),
                 4 => text.push_str("short,line\n"),
-                5 if round % 3 == 2 => text.push_str(&format!("g,s,{id}refound,a,p,acgt,n,location:bad\n")),
+                5 if round % 3 == 2 => {
+                    text.push_str(&format!("g,s,{id}refound,a,p,acgt,n,location:bad\n"))
+                }
                 6 => text.push_str("\n"),
                 _ => text.push_str(&format!("g{i},s{i},{id},a{i},p,acgtn,n,d,extra\r\n")),
             }

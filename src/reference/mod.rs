@@ -26,9 +26,9 @@ use petgraph::graph::NodeIndex;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
 #[cfg(test)]
 use std::io::BufReader;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub struct Member {
@@ -78,7 +78,7 @@ pub fn generate_pan_genome_reference(
     output_dir: &str,
 ) -> Result<()> {
     let preload = preload_reference(graph, gene_data_file, input_files.len());
-    generate_pan_genome_reference_with(preload, graph, input_files, family_names, output_dir)
+    generate_pan_genome_reference_with(preload, graph, input_files, family_names, output_dir, false)
 }
 
 /// The first family-structure problem found while indexing members, in the
@@ -158,6 +158,7 @@ pub fn generate_pan_genome_reference_with(
     input_files: &[String],
     family_names: &HashMap<NodeIndex, String>,
     output_dir: &str,
+    write_codes: bool,
 ) -> Result<()> {
     let ReferencePreload {
         nodes,
@@ -179,7 +180,9 @@ pub fn generate_pan_genome_reference_with(
             if *error_position == position {
                 match error {
                     StructureError::TooManyFamilies(error) => {
-                        return Err(anyhow::Error::new(*error).context("Too many reference families"))
+                        return Err(
+                            anyhow::Error::new(*error).context("Too many reference families")
+                        )
                     }
                     StructureError::NoMembers => {
                         bail!("Family {name} has no member sequences for reference selection")
@@ -337,7 +340,7 @@ pub fn generate_pan_genome_reference_with(
         Path::new(output_dir).join("reference_report.tsv"),
     )?);
     writeln!(report, "gene\treference_bp\tintact\tselection\tsamples_present\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles\tsource_seq_ids")?;
-    for (&node, selected) in nodes.iter().zip(selected) {
+    for (&node, selected) in nodes.iter().zip(&selected) {
         let name = &family_names[&node];
         writeln!(fasta, ">{name}")?;
         for chunk in selected.choice.dna.as_bytes().chunks(60) {
@@ -364,10 +367,74 @@ pub fn generate_pan_genome_reference_with(
     }
     fasta.flush()?;
     report.flush()?;
+    if write_codes {
+        write_mutation_codes(
+            output_dir,
+            input_files,
+            &nodes,
+            family_names,
+            &selected,
+            &groups,
+            &calls,
+            &pools,
+            &member_ids,
+        )?;
+    }
     log::info!(
         "Reference selection: excluded {} distinct short refound candidates",
         excluded_refound_short
     );
+    Ok(())
+}
+
+fn write_mutation_codes(
+    output_dir: &str,
+    input_files: &[String],
+    nodes: &[NodeIndex],
+    family_names: &HashMap<NodeIndex, String>,
+    selected: &[Selected],
+    groups: &FxMap<u32, Vec<usize>>,
+    calls: &[model::Call],
+    pools: &model::Pools,
+    member_ids: &[String],
+) -> Result<()> {
+    let samples: Vec<String> = input_files
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            Path::new(path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("isolate_{index}"))
+        })
+        .collect();
+    let mut file = BufWriter::new(File::create(
+        Path::new(output_dir).join("mutation_codes.tsv"),
+    )?);
+    writeln!(file, "{}", crate::mutcode::HEADER)?;
+    for (cluster, (&node, chosen)) in nodes.iter().zip(selected).enumerate() {
+        let cluster = u32::try_from(cluster)?;
+        let reference = chosen.choice.dna.as_str();
+        let sources: HashSet<&str> = chosen.sources.iter().map(String::as_str).collect();
+        let mut copies: Vec<crate::mutcode::Copy<'_>> = groups[&cluster]
+            .iter()
+            .map(|&index| {
+                let id = member_ids[index].as_str();
+                let dna = pools.dna[calls[index].dna as usize].as_str();
+                crate::mutcode::Copy {
+                    sample: &samples[calls[index].sample as usize],
+                    id,
+                    dna,
+                    refound: calls[index].refound,
+                    is_reference: dna == reference && sources.contains(id),
+                }
+            })
+            .collect();
+        copies.sort_by(|left, right| (left.sample, left.id).cmp(&(right.sample, right.id)));
+        crate::mutcode::write_family(&mut file, &family_names[&node], reference, &copies)?;
+    }
+    file.flush()?;
     Ok(())
 }
 
@@ -605,7 +672,11 @@ fn read_members(
         match chunk.error {
             None => {}
             Some(MemberError::InvalidAt(line)) => {
-                bail!("Invalid reference metadata at {}:{}", path, line_offset + line + 2);
+                bail!(
+                    "Invalid reference metadata at {}:{}",
+                    path,
+                    line_offset + line + 2
+                );
             }
             Some(MemberError::Plain(error, member)) => {
                 if let Some((slot, id)) = member {

@@ -25,17 +25,18 @@ enabled by default; use `--skip-core-aln` to omit them.
 
 ## Performance
 
-v1.1.2 writes the same output as v1.1.0, plus `struct_presence_absence.Rtab`.
+v1.1.3 writes the same output as v1.1.0, plus `struct_presence_absence.Rtab`.
 That file is written after the pipeline is timed, so the times below are the
-v1.1.1 runs. On these six cohorts, every other file in the output archive
+v1.1.1 runs. `--mut-code` is off unless requested, so these runs do not write
+mutation codes. On these six cohorts, every other file in the output archive
 matched the v1.1.0 archive except `rustaroo.log`.
 
 Times are pipeline wall time at 32 threads on Anatra `lifesci` (dual AMD EPYC
 9684X), with `--clean-mode strict --remove-invalid-genes --skip-core-aln`.
-Panaroo 1.8.1 and Rustaroo 1.1.0 are the published runs. Rustaroo 1.1.2 is the
+Panaroo 1.8.1 and Rustaroo 1.1.0 are the published runs. Rustaroo 1.1.3 is the
 same cohorts. A speedup is the baseline wall time divided by the new wall time.
 
-| Species | Genomes | Panaroo 1.8.1 (s) | Rustaroo 1.1.0 (s) | Rustaroo 1.1.2 (s) | 1.1.0 over Panaroo | 1.1.2 over Panaroo | 1.1.2 over 1.1.0 |
+| Species | Genomes | Panaroo 1.8.1 (s) | Rustaroo 1.1.0 (s) | Rustaroo 1.1.3 (s) | 1.1.0 over Panaroo | 1.1.3 over Panaroo | 1.1.3 over 1.1.0 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | *K. pneumoniae* | 500 | 855.38 | 319.06 | 259.9 | 2.68× | 3.29× | 1.23× |
 | *K. pneumoniae* | 1,015 | 2,662.15 | 568.31 | 478.4 | 4.68× | 5.56× | 1.19× |
@@ -57,9 +58,10 @@ same cohorts. A speedup is the baseline wall time divided by the new wall time.
 
 The output directory includes presence/absence tables, family references,
 `reference_report.tsv`, `final_graph.gml`, `struct_presence_absence.Rtab`, and
-summary statistics. Use
+summary statistics. `--mut-code` also writes `mutation_codes.tsv`. Use
 `--minimal` to retain only the log, reference FASTA, and main presence/absence
-table. Output and reference behavior may differ from other implementations.
+table, plus `mutation_codes.tsv` when `--mut-code` is set. Output and reference
+behavior may differ from other implementations.
 
 ## Tests
 

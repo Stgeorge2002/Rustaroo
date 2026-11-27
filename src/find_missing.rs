@@ -408,12 +408,9 @@ impl PackedWindow {
             let data = bytes
                 .chunks(4)
                 .map(|chunk| {
-                    chunk
-                        .iter()
-                        .enumerate()
-                        .fold(0u8, |packed, (k, &base)| {
-                            packed | (BASE_CODES[usize::from(base)] << (2 * k))
-                        })
+                    chunk.iter().enumerate().fold(0u8, |packed, (k, &base)| {
+                        packed | (BASE_CODES[usize::from(base)] << (2 * k))
+                    })
                 })
                 .collect();
             Self {
@@ -532,7 +529,9 @@ impl AlignmentCache {
         // A concurrent miss may already have populated the slot. Collisions
         // also leave the existing entry alone; neither case changes the result.
         if !state.windows.contains_key(&key) {
-            let charge = stored.stored_bytes().saturating_add(ALIGNMENT_ENTRY_OVERHEAD);
+            let charge = stored
+                .stored_bytes()
+                .saturating_add(ALIGNMENT_ENTRY_OVERHEAD);
             while state.charged_bytes > self.shard_budget - charge {
                 let oldest = state.fifo.pop_front().expect("charged cache is not empty");
                 let evicted = state.windows.remove(&oldest).expect("FIFO key is cached");
@@ -1339,22 +1338,17 @@ mod tests {
         assert_eq!(lines, 3);
         assert_eq!(early, load_annotation_ids(path_str)?);
         std::fs::write(&path, format!("{initial}{appended}"))?;
-        let (extended, lines) =
-            load_annotation_ids_from(path_str, early, initial.len() as u64, 3)?;
+        let (extended, lines) = load_annotation_ids_from(path_str, early, initial.len() as u64, 3)?;
         assert_eq!(lines, 5);
         assert_eq!(extended, load_annotation_ids(path_str)?);
         assert_eq!(extended["0_0_1"], "ann1b");
         // Errors carry the same line numbers as a full load.
         std::fs::write(&path, format!("{initial}a,s,,x\n"))?;
         let full = load_annotation_ids(path_str).unwrap_err().to_string();
-        let partial = load_annotation_ids_from(
-            path_str,
-            AnnotationIds::default(),
-            initial.len() as u64,
-            3,
-        )
-        .unwrap_err()
-        .to_string();
+        let partial =
+            load_annotation_ids_from(path_str, AnnotationIds::default(), initial.len() as u64, 3)
+                .unwrap_err()
+                .to_string();
         assert_eq!(partial, full);
         Ok(())
     }

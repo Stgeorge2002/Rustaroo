@@ -141,7 +141,10 @@ mod tests {
                     let mut chunked = Vec::new();
                     let chunks = line_chunks(path, start, parts)?;
                     assert_eq!(chunks.first().unwrap().0, start);
-                    assert_eq!(chunks.last().unwrap().1, content.len().max(start as usize) as u64);
+                    assert_eq!(
+                        chunks.last().unwrap().1,
+                        content.len().max(start as usize) as u64
+                    );
                     for (from, to) in chunks {
                         let mut lines = LineReader::open_range(path, from, to)?;
                         while let Some(line) = lines.next_line() {

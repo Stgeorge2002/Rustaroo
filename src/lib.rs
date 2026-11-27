@@ -20,6 +20,7 @@ pub mod integrate;
 pub(crate) mod line_reader;
 pub mod merge_graphs;
 pub mod merge_nodes;
+mod mutcode;
 pub mod neighborhood;
 pub mod network;
 pub mod output;
