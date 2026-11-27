@@ -2,6 +2,7 @@
 //!
 //! Port of core output generation from rustaroo/generate_output.py
 
+use crate::network::ordered_edges;
 use crate::network::Graph;
 use crate::network::{GeneEdge, GeneNode};
 use anyhow::{Context, Result};
@@ -192,6 +193,86 @@ pub fn generate_roary_gene_presence_absence(
     csv_file.flush()?;
     rtab_file.flush()?;
     Ok(family_names)
+}
+
+/// Presence/absence of local rearrangements, as Panaroo's
+/// `struct_presence_absence.Rtab`.
+///
+/// A row is a gene with at least three neighbours and one pair of those
+/// edges. The genomes in the row are the genomes that use both edges, and
+/// the row is kept when that set is at least `min_variant_support`. The name
+/// is `neighbour-centre-neighbour`, in the order the edges were added.
+pub fn generate_common_struct_presence_absence(
+    graph: &Graph<GeneNode, GeneEdge>,
+    family_names: &HashMap<NodeIndex, String>,
+    mems_to_isolates: &HashMap<usize, String>,
+    output_dir: &str,
+    min_variant_support: usize,
+) -> Result<()> {
+    let mut isolates: Vec<_> = mems_to_isolates.iter().collect();
+    isolates.sort_by_key(|(member, _)| **member);
+    let members: Vec<usize> = isolates.iter().map(|(member, _)| **member).collect();
+    let isolate_names: Vec<&str> = isolates.iter().map(|(_, name)| name.as_str()).collect();
+
+    // Walk centres from oldest to newest so a rebuilt graph keeps the same
+    // row order. Edge pairs follow the order the edges were inserted.
+    let mut centres: Vec<NodeIndex> = graph.node_identifiers().collect();
+    centres.sort_by_key(|node| (graph[*node].creation_order, node.index()));
+
+    let mut rows = Vec::new();
+    let mut incident = Vec::new();
+    for centre in centres {
+        ordered_edges(graph, centre, &mut incident);
+        if incident.len() < 3 {
+            continue;
+        }
+        for left in 0..incident.len() {
+            for right in (left + 1)..incident.len() {
+                let left_edge = incident[left].1;
+                let right_edge = incident[right].1;
+                let shared: std::collections::BTreeSet<usize> = graph[left_edge]
+                    .members
+                    .intersection(&graph[right_edge].members)
+                    .copied()
+                    .collect();
+                if shared.len() < min_variant_support {
+                    continue;
+                }
+                let first = incident[left].2;
+                let second = incident[right].2;
+                rows.push((
+                    format!(
+                        "{}-{}-{}",
+                        family_names.get(&first).map_or("", String::as_str),
+                        family_names.get(&centre).map_or("", String::as_str),
+                        family_names.get(&second).map_or("", String::as_str)
+                    ),
+                    shared,
+                ));
+            }
+        }
+    }
+
+    let path = Path::new(output_dir).join("struct_presence_absence.Rtab");
+    let mut file = BufWriter::new(File::create(path)?);
+    write!(file, "Gene")?;
+    for name in isolate_names {
+        write!(file, "\t{name}")?;
+    }
+    writeln!(file)?;
+    for (name, shared) in &rows {
+        write!(file, "{name}")?;
+        for member in &members {
+            write!(
+                file,
+                "\t{}",
+                if shared.contains(member) { "1" } else { "0" }
+            )?;
+        }
+        writeln!(file)?;
+    }
+    file.flush()?;
+    Ok(())
 }
 
 /// Write GML graph file (NetworkX-compatible format)
@@ -445,6 +526,97 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(dir.path().join("gene_presence_absence_roary.csv"))?,
             "Gene,Non-unique Gene name,Annotation,No. isolates,No. sequences,Avg sequences per isolate,Genome Fragment,Order within Fragment,Accessory Fragment,Accessory Order with Fragment,QC,Min group size nuc,Max group size nuc,Avg group size nuc,A,B\nother,other,,2,2,1.00,3,1,,,,6,6,6.0,0_0_2,1_0_3\ngene,gene,first,1,1,1.00,1,1,,,,3,3,3.0,0_0_1,\ngroup_0,gene,second,1,2,2.00,2,1,,,,3,6,4.5,,real\n");
+        Ok(())
+    }
+
+    #[test]
+    fn structural_variants_keep_edge_pairs_shared_by_enough_genomes() -> Result<()> {
+        use crate::network::add_ordered_edge;
+
+        let dir = tempfile::TempDir::new()?;
+        let mut graph = Graph::default();
+        let centre = graph.add_node(GeneNode {
+            creation_order: 0,
+            ..Default::default()
+        });
+        let left = graph.add_node(GeneNode {
+            creation_order: 1,
+            ..Default::default()
+        });
+        let right = graph.add_node(GeneNode {
+            creation_order: 2,
+            ..Default::default()
+        });
+        let rare = graph.add_node(GeneNode {
+            creation_order: 3,
+            ..Default::default()
+        });
+        let side = graph.add_node(GeneNode {
+            creation_order: 4,
+            ..Default::default()
+        });
+        let genomes = |ids: &[usize]| ids.iter().copied().collect();
+        add_ordered_edge(
+            &mut graph,
+            centre,
+            left,
+            GeneEdge {
+                size: 2,
+                members: genomes(&[0, 1]),
+                ..Default::default()
+            },
+        );
+        add_ordered_edge(
+            &mut graph,
+            centre,
+            right,
+            GeneEdge {
+                size: 2,
+                members: genomes(&[0, 1]),
+                ..Default::default()
+            },
+        );
+        add_ordered_edge(
+            &mut graph,
+            centre,
+            rare,
+            GeneEdge {
+                size: 1,
+                members: genomes(&[1]),
+                ..Default::default()
+            },
+        );
+        // Two neighbours: a linear gene, so it contributes no rearrangement.
+        add_ordered_edge(
+            &mut graph,
+            left,
+            side,
+            GeneEdge {
+                size: 1,
+                members: genomes(&[0]),
+                ..Default::default()
+            },
+        );
+
+        let names = HashMap::from([
+            (centre, "centre".into()),
+            (left, "left".into()),
+            (right, "right".into()),
+            (rare, "rare".into()),
+            (side, "side".into()),
+        ]);
+        let isolates = HashMap::from([(0, "g0".into()), (1, "g1".into()), (2, "g2".into())]);
+        generate_common_struct_presence_absence(
+            &graph,
+            &names,
+            &isolates,
+            dir.path().to_str().unwrap(),
+            2,
+        )?;
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("struct_presence_absence.Rtab"))?,
+            "Gene\tg0\tg1\tg2\nleft-centre-right\t1\t1\t0\n"
+        );
         Ok(())
     }
 }

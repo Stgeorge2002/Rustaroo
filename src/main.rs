@@ -663,12 +663,21 @@ fn run_rustaroo_pipeline(
             let gml_file = outdir_path.join("final_graph.gml");
             output::write_gml(&graph, gml_file.to_str().unwrap())?;
             output::write_summary_stats(&graph, &outdir, all_genes.len())?;
+            output::generate_common_struct_presence_absence(
+                &graph,
+                &family_names,
+                &mems_to_isolates,
+                &outdir,
+                rustaroo_args.min_edge_support_sv.unwrap_or(2),
+            )?;
             Ok(stage_started.elapsed())
         };
         let (reference_elapsed, graph_elapsed) = rayon::join(reference, graph_files);
         timings.push(("Reference generation", reference_elapsed?));
         timings.push(("Graph and summary output", graph_elapsed?));
-        log::info!("Generated presence/absence matrix, reference, and graph files");
+        log::info!(
+            "Generated presence/absence matrix, reference, graph, and structural variants"
+        );
     }
     log::info!(
         "Output generation completed in {:.3}s",
