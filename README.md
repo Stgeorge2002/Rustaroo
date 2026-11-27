@@ -25,15 +25,17 @@ enabled by default; use `--skip-core-aln` to omit them.
 
 ## Performance
 
-v1.1.1 writes the same output as v1.1.0. On the six cohorts below, every file
-in the output archive matched the v1.1.0 archive except `rustaroo.log`.
+v1.1.2 writes the same output as v1.1.0, plus `struct_presence_absence.Rtab`.
+That file is written after the pipeline is timed, so the times below are the
+v1.1.1 runs. On these six cohorts, every other file in the output archive
+matched the v1.1.0 archive except `rustaroo.log`.
 
 Times are pipeline wall time at 32 threads on Anatra `lifesci` (dual AMD EPYC
 9684X), with `--clean-mode strict --remove-invalid-genes --skip-core-aln`.
-Panaroo 1.8.1 and Rustaroo 1.1.0 are the published runs. Rustaroo 1.1.1 is the
+Panaroo 1.8.1 and Rustaroo 1.1.0 are the published runs. Rustaroo 1.1.2 is the
 same cohorts. A speedup is the baseline wall time divided by the new wall time.
 
-| Species | Genomes | Panaroo 1.8.1 (s) | Rustaroo 1.1.0 (s) | Rustaroo 1.1.1 (s) | 1.1.0 over Panaroo | 1.1.1 over Panaroo | 1.1.1 over 1.1.0 |
+| Species | Genomes | Panaroo 1.8.1 (s) | Rustaroo 1.1.0 (s) | Rustaroo 1.1.2 (s) | 1.1.0 over Panaroo | 1.1.2 over Panaroo | 1.1.2 over 1.1.0 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | *K. pneumoniae* | 500 | 855.38 | 319.06 | 259.9 | 2.68× | 3.29× | 1.23× |
 | *K. pneumoniae* | 1,015 | 2,662.15 | 568.31 | 478.4 | 4.68× | 5.56× | 1.19× |
@@ -54,7 +56,8 @@ same cohorts. A speedup is the baseline wall time divided by the new wall time.
 ## Results
 
 The output directory includes presence/absence tables, family references,
-`reference_report.tsv`, `final_graph.gml`, and summary statistics. Use
+`reference_report.tsv`, `final_graph.gml`, `struct_presence_absence.Rtab`, and
+summary statistics. Use
 `--minimal` to retain only the log, reference FASTA, and main presence/absence
 table. Output and reference behavior may differ from other implementations.
 
